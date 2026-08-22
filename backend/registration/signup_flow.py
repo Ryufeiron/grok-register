@@ -1486,6 +1486,62 @@ def _try_click_turnstile_frame(log_callback=None):
     if log_callback:
         log_callback(f"[Debug] Turnstile frame 已定位: {frame_url[:100]}")
 
+    # ---- 策略 0：shadow-root 穿透寻找真实 checkbox（playwright-captcha 同款技术）----
+    # Turnstile 的 checkbox 常渲染在 iframe 内 shadow DOM 里，坐标盲点点不到；
+    # 遍历 shadow roots 从内部找到 input[type=checkbox] 并点击。
+    try:
+        js_collect = """
+() => {
+  const roots = [];
+  function collectShadowRoots(node) {
+    if (!node) return;
+    const shadow = node.shadowRoot;
+    if (shadow) { roots.push(shadow); collectShadowRoots(shadow); }
+    for (const el of node.querySelectorAll("*")) {
+      if (el.shadowRoot) collectShadowRoots(el);
+    }
+  }
+  collectShadowRoots(document);
+  return roots.length;
+}
+        """
+        shadow_count = int(turnstile_frame.evaluate(js_collect) or 0)
+        if shadow_count > 0:
+            handle = turnstile_frame.evaluate_handle(
+                """
+() => {
+  const roots = [];
+  function collectShadowRoots(node) {
+    if (!node) return;
+    const shadow = node.shadowRoot;
+    if (shadow) { roots.push(shadow); collectShadowRoots(shadow); }
+    for (const el of node.querySelectorAll("*")) {
+      if (el.shadowRoot) collectShadowRoots(el);
+    }
+  }
+  collectShadowRoots(document);
+  return roots;
+}
+                """
+            )
+            props = handle.get_properties()
+            for shadow_handle in props.values():
+                element = shadow_handle.as_element()
+                if not element:
+                    continue
+                checkbox_elements = element.query_selector_all('input[type="checkbox"]')
+                for cb in checkbox_elements:
+                    if cb.is_visible():
+                        cb.click(force=True, timeout=3000)
+                        if log_callback:
+                            log_callback("[*] Turnstile shadow-root checkbox 已点击")
+                        return
+            if log_callback:
+                log_callback(f"[Debug] Turnstile shadow-roots 存在({shadow_count})但未找到 checkbox")
+    except Exception as shadow_exc:
+        if log_callback:
+            log_callback(f"[Debug] Turnstile shadow-root 搜索失败: {shadow_exc}")
+
     # ---- 策略 1：frame body 坐标点击（Turnstile 实际交互方式）----
     # Turnstile iframe 内没有 checkbox DOM 元素（inputs=[]），
     # 交互区域是 canvas/overlay，只能通过坐标点击。
