@@ -1,0 +1,24 @@
+name: xai-probe
+on:
+  push:
+    branches: [ xai-probe ]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: xai connectivity probe
+        run: |
+          echo "== runner geo =="
+          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip=|loc=|colo="
+          echo ""
+          echo "== accounts.x.ai/sign-up =="
+          curl -sL --max-time 30 -o /tmp/http.txt -w "HTTP %{http_code}\n" "https://accounts.x.ai/sign-up?redirect=grok-com"
+          grep -io "service is not available[^<{}]*" /tmp/http.txt | head -1
+          head -c 400 /tmp/http.txt; echo ""
+          echo "== auth.x.ai authorize GET =="
+          curl -sL --max-time 30 -o /tmp/azu.txt -w "HTTP %{http_code}\n" "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492-073a-47ea-816f-4c329264a828&redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback&scope=openid&state=t"
+          head -c 400 /tmp/azu.txt; echo ""
+          echo "== device/code POST =="
+          curl -s --max-time 30 -o /tmp/dev.txt -w "HTTP %{http_code}\n" -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "client_id=b1a00492-073a-47ea-816f-4c329264a828&scope=openid%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess" "https://auth.x.ai/oauth2/device/code"
+          head -c 400 /tmp/dev.txt; echo ""
