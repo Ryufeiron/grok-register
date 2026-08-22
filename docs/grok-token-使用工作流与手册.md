@@ -310,9 +310,19 @@ python tools/grok_gateway.py --token-file data/cpa_auth/xai-<邮箱>.json --port
 # 或直接传 token / 环境变量
 python tools/grok_gateway.py --token "xai-..." --port 40200
 python tools/grok_gateway.py --token-env GROK_TOKEN --port 40200
+
+# 多账号自动轮换（★ 推荐：data/cpa_auth 下所有 token 都加载，轮流使用）
+python tools/grok_gateway.py --token-dir data/cpa_auth --port 40200
 ```
 
 启动后本机出现一个 OpenAI 兼容端点 **`http://127.0.0.1:40200/v1`**：自动帮你加 `Authorization: Bearer <token>`、`x-grok-client-version` 等头，并转发到 cli-chat-proxy.grok.com。`/v1/models`、`/v1/chat/completions`、`/v1/responses` 全部实测 200。
+
+**多 token 自动切换策略（`--token-dir` 模式）**：
+
+- 加载目录下所有含 `access_token` 的 JSON（如 `data/cpa_auth/xai-*.json`），启动时打印账号列表。
+- 请求按 round-robin 顺序自动轮换账号使用。
+- 收到 **429（限流）** 或 **401/403（token 失效）** 时自动把该 token 冷却 `--ban-seconds` 秒（默认 300s）并立即切换下一个 token 重试，客户端无感知。
+- token 冷却结束后自动回到轮换池。
 
 #### 6.3.2 在 cc-switch 中添加 Grok provider（Claude Code 举例）
 
