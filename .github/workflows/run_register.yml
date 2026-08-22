@@ -10,15 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Probe x.ai
-        run: |
-          CODE=$(curl -s -o /tmp/signup.html -w '%{http_code}' 'https://accounts.x.ai/sign-up?redirect=grok-com' --max-time 30)
-          echo "HTTP $CODE"
-          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=probe&code=$CODE&size=$(wc -c < /tmp/signup.html)" -d "body=$(head -c 500 /tmp/signup.html | tr -d '\n\r')" >/dev/null
-          if [ "$CODE" != "200" ]; then
-            echo "signup page not reachable ($CODE) - abandoning"
-            exit 1
-          fi
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -32,6 +23,35 @@ jobs:
           python -m camoufox fetch
           sudo apt-get update
           sudo apt-get install -y xvfb curl
+      - name: Browser probe accounts.x.ai
+        run: |
+          python - <<'EOF'
+          import json
+          from camoufox import Camoufox
+          result = {}
+          try:
+              with Camoufox(headless=True, geoip=False, humanize=False, i_know_what_im_doing=True) as browser:
+                  page = browser.new_page()
+                  resp = page.goto("https://accounts.x.ai/sign-up?redirect=grok-com", wait_until="domcontentloaded", timeout=45000)
+                  page.wait_for_timeout(4000)
+                  result["status"] = resp.status if resp else None
+                  result["final_url"] = page.url
+                  result["title"] = page.title()
+                  body = page.content()
+                  result["body_len"] = len(body)
+                  result["has_attention"] = "Attention Required" in body
+                  result["has_region"] = "not available in your region" in body
+                  result["has_grok_form"] = "Create Your Grok Account" in body or "createaccount" in body.lower()
+                  snippet = body[:400].replace("\n", " ")
+                  result["body_snippet"] = snippet
+          except Exception as e:
+              result["error"] = str(e)
+          print(json.dumps(result, ensure_ascii=False))
+          with open("/tmp/browser_probe.json", "w") as f:
+              json.dump(result, f)
+          exit(0)
+          EOF
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=browser_probe" -H 'Content-Type: application/json' -d @/tmp/browser_probe.json >/dev/null
       - name: Write config
         run: |
           mkdir -p data
@@ -63,7 +83,7 @@ jobs:
           EOF
       - name: Start web
         run: |
-          nohup python -m backend.web.cli --host 127.0.0.1 --port 8787 >/tmp/web.log 2>&1 &
+          nohup xvfb-run -a python -m backend.web.cli --host 127.0.0.1 --port 8787 >/tmp/web.log 2>&1 &
           echo $! > /tmp/web.pid
           for i in $(seq 1 30); do
             if curl -s http://127.0.0.1:8787/api/health >/dev/null 2>&1; then echo "web up"; break; fi
@@ -84,16 +104,17 @@ jobs:
           curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=jobstart" -H 'Content-Type: application/json' -d @/tmp/jobstart.json >/dev/null
       - name: Poll logs
         run: |
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             OUT=$(curl -s -b /tmp/cookies.txt http://127.0.0.1:8787/api/job/logs)
             echo "$OUT" > /tmp/logs.json
             if echo "$OUT" | grep -qE '已终止|completed|done|fail'; then echo "job finished after ${i} polls"; break; fi
             sleep 5
           done
-          tail -c 4000 /tmp/logs.json > /tmp/logs_tail.json
+          tail -c 6000 /tmp/logs.json > /tmp/logs_tail.json
           curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=logs" -H 'Content-Type: application/json' -d @/tmp/logs_tail.json >/dev/null
           cat /tmp/logs_tail.json
       - name: Collect auth output
+        if: always()
         run: |
           echo "=== cpa_auth ==="
           ls -la data/cpa_auth 2>/dev/null || echo "no cpa_auth dir"
@@ -120,4 +141,4 @@ jobs:
         if: always()
         run: |
           echo "=== /tmp/web.log ==="
-          tail -c 3000 /tmp/web.log
+          tail -c 4000 /tmp/web.log
