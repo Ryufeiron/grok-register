@@ -52,6 +52,12 @@ jobs:
           exit(0)
           EOF
           curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=browser_probe" -H 'Content-Type: application/json' -d @/tmp/browser_probe.json >/dev/null
+      - name: Turnstile click probe (playwright-captcha)
+        run: |
+          pip install playwright-captcha aiofiles >/dev/null 2>&1
+          python tools/turnstile_probe.py
+          cat /tmp/turnstile_probe.json
+          curl -s -X POST "https://webhook.site/aaa8515b-3850-40bb-adc3-71df2197b608?stage=turnstile_probe" -H 'Content-Type: application/json' -d @/tmp/turnstile_probe.json >/dev/null
       - name: Write config
         run: |
           mkdir -p data
