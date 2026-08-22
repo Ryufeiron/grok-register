@@ -9,9 +9,10 @@
 3. [方案 A：GitHub Actions 全自动流水线（推荐）](#3-方案-agitHub-actions-全自动流水线推荐)
 4. [方案 B：本机/服务器部署](#4-方案-b本机服务器部署)
 5. [Token 使用方法](#5-token-使用方法)
-6. [关键配置项说明](#6-关键配置项说明)
-7. [常见问题排查](#7-常见问题排查)
-8. [风险与合规声明](#8-风险与合规声明)
+6. [集成到 AI Agent（Claude Code / Codex / OpenCode 等）](#6-集成到-ai-agentclaude-code--codex--opencode-等)
+7. [关键配置项说明](#7-关键配置项说明)
+8. [常见问题排查](#8-常见问题排查)
+9. [风险与合规声明](#9-风险与合规声明)
 
 ---
 
@@ -245,7 +246,123 @@ curl -s -X POST https://auth.x.ai/oauth2/token \
 - `grok2api_auth/g2a-*.json` 是 Grok2API 项目的 JSON 导入格式（provider: grok_build），可在 Grok2API 管理端直接导入，变成 OpenAI 兼容服务。
 - 平台配置里 `grok2api_auto_import=true` + 填 `grok2api_remote_url` / `grok2api_management_key` 可实现注册后自动推送。
 
-## 6. 关键配置项说明
+## 6. 集成到 AI Agent（Claude Code / Codex / OpenCode 等）
+
+免费 token 拿到手后，可以把它接入你日常的 AI 编程工具（cc-switch / Claude Code / Codex / OpenCode / Grok Build）。核心只有两个问题，解决后就全部通用：
+
+1. **地址**：一律指向 `https://cli-chat-proxy.grok.com/v1`（不能用 api.x.ai）。
+2. **版本头**：请求必须带 `x-grok-client-version` 头（缺了直接 426 "Grok CLI version is outdated"）。实测**只需要这一个头**（值 `0.1.202` 及以上即可），其余头可省。
+
+> 实测（2026-08-23）：只带 `x-grok-client-version: 0.1.202`，`/v1/responses` 与 `/v1/chat/completions` 均 200 正常出词。
+
+### 6.1 核心障碍：如何带上版本头
+
+| 客户端 | 能否自定义请求头 | 处理方式 |
+|---|---|---|
+| OpenCode（自定义 provider） | ✅ `options.headers` | 直接写配置（见 6.2），零额外组件 |
+| cc-switch 本地代理（15721） | ❌ 代理不注入该头，表单的自定义 header 也不下发 | 上游挂一个"头注入网关"（见 6.3） |
+| Claude Code / Codex | ❌ 只认 base_url + api_key | 同上，经网关 |
+| Grok Build (grok CLI) | ✅ 直接支持 api_key + base_url | 需网关或直接配（grok CLI 自带版本头） |
+
+### 6.2 方式一：OpenCode 直接集成（最简单，无需任何中间件）
+
+把下面这段合并进 `~/.config/opencode/opencode.json` 的 `provider` 节点（没有该文件就新建）：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "grok-free": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Grok Free",
+      "options": {
+        "baseURL": "https://cli-chat-proxy.grok.com/v1",
+        "apiKey": "xai-粘贴你的access_token",
+        "headers": {
+          "x-grok-client-version": "0.1.202",
+          "x-grok-client-identifier": "grok-pager",
+          "User-Agent": "grok-pager/0.1.202 grok-shell/0.1.202 (linux; x86_64)"
+        }
+      },
+      "models": {
+        "grok-4.6": { "name": "Grok 4.6 (free)" },
+        "grok-4.5": { "name": "Grok 4.5 (free)" }
+      }
+    }
+  }
+}
+```
+
+- `npm` 必须用 `@ai-sdk/openai-compatible`（OpenAI 兼容适配器，内部走 chat/completions）。
+- 之后 opencode 内 `/models` 选择 `Grok Free` 下的 grok-4.6 即可使用。
+- 若不想把 token 写死在文件里，可换成环境变量并配 `opencode auth` 连接流程。
+
+### 6.3 方式二：头注入网关 + cc-switch（Claude Code / Codex / Gemini 全家桶）
+
+cc-switch 是 Tauri 桌面应用（管理 Claude Code、Codex、Gemini CLI、Grok Build、OpenCode 等的 provider 切换与本地代理）。它的本地代理能把 Claude 的 Anthropic 格式转换成 OpenAI Responses/Chat 转发上游，但它**不会加 grok 版本头**。所以我们在上游前面挂一层本地"头注入网关"，把 token 与版本头都替客户端补上。
+
+#### 6.3.1 启动头注入网关（本项目内置工具）
+
+```bash
+# 指向 token 文件（cpa_auth/xai-*.json 或只存 access_token 的文本都行）
+python tools/grok_gateway.py --token-file data/cpa_auth/xai-<邮箱>.json --port 40200
+
+# 或直接传 token / 环境变量
+python tools/grok_gateway.py --token "xai-..." --port 40200
+python tools/grok_gateway.py --token-env GROK_TOKEN --port 40200
+```
+
+启动后本机出现一个 OpenAI 兼容端点 **`http://127.0.0.1:40200/v1`**：自动帮你加 `Authorization: Bearer <token>`、`x-grok-client-version` 等头，并转发到 cli-chat-proxy.grok.com。`/v1/models`、`/v1/chat/completions`、`/v1/responses` 全部实测 200。
+
+#### 6.3.2 在 cc-switch 中添加 Grok provider（Claude Code 举例）
+
+1. 打开 cc-switch → **Providers** → **Claude** → **添加 Provider**。
+2. 名称随意（如 `Grok Free`）。
+3. **Base URL**：填 `http://127.0.0.1:40200/v1`（网关地址）。
+4. **API Key**：随便填一个非空占位（如 `grok`）——真正的 token 由网关注入，这个字段只是满足客户端非空校验。
+5. **Advanced → API Format**：选 **OpenAI Responses**（走 `/v1/responses`，grok-4.6 实测支持；选 OpenAI Chat 也行，走 grok-4.5）。
+6. 保存并设为当前 provider，开启 cc-switch 本地代理（http://127.0.0.1:15721）并启用该 app 的代理接管。
+
+之后 Claude Code 的流量路径：
+
+```
+Claude Code → cc-switch 代理 (127.0.0.1:15721, Anthropic→OpenAI 转换)
+           → grok_gateway (127.0.0.1:40200, 注入 token+版本头)
+           → cli-chat-proxy.grok.com/v1 (真实 grok API)
+```
+
+#### 6.3.3 Codex / Gemini CLI
+
+- **Codex**：添加 Codex provider → Base URL 填 `http://127.0.0.1:40200/v1`，API Key 填占位 → config.toml 里 `wire_api = "responses"`（或 `chat_completions`），保存启用即可。Codex 走 `~/.codex/config.toml` + `auth.json`。
+- **Gemini CLI**：添加 Gemini provider → Base URL 填 `http://127.0.0.1:40200/v1`，key 占位。gemini 原生协议转换复杂度高，实测无保证，建议优先 Claude/Codex。
+
+#### 6.3.4 Grok CLI (grok build) 直连
+
+```toml
+# ~/.grok/config.toml
+[models]
+default = "grok-4.6"
+
+[model."grok-4.6"]
+model = "grok-4.6"
+base_url = "http://127.0.0.1:40200/v1"
+name = "Grok Free"
+api_key = "grok"          # 占位，网关会替换
+api_backend = "responses"
+```
+
+> grok CLI 自己是官方客户端，自带版本头，所以也可以不用网关，把 `base_url` 直接写成 `https://cli-chat-proxy.grok.com/v1` + 真实 token。用网关的好处是 token 集中管理、可轮换。
+
+### 6.4 网关常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 网关 502 "Bad Gateway" | token 过期或网络不通；换 token 重启网关 |
+| 客户端 404 但 curl 网关正常 | 客户端请求路径带了 `/v1/v1`，cc-switch 会自动去重；直连 opencode 时 baseURL 不要带 `/v1` 后缀之外的重复段 |
+| response_format/stream 报错 | grok 4.6 responses 不支持部分参数；可改 model 为 grok-4.5 + chat 端点 |
+| 想自动续期 | 网关暂不轮换 token；接入本平台的 refresh 逻辑（backend/integrations/auth_exchange.py）可定时刷新后重启网关 |
+
+## 7. 关键配置项说明
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
@@ -262,7 +379,7 @@ curl -s -X POST https://auth.x.ai/oauth2/token \
 | `enable_nsfw` | true | 是否在新账号开启 NSFW 解锁 |
 | `register_count` + `account_interval` | 60-120s | 多账号间隔随机化，降低风控 |
 
-## 7. 常见问题排查
+## 8. 常见问题排查
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
@@ -276,7 +393,7 @@ curl -s -X POST https://auth.x.ai/oauth2/token \
 | connectivity 检查 xAI 红 | 出口被拒 | 看上面 403 两条 |
 | artifact 下载按钮找不到 | GitHub 页面交互限制 | 直接在地址栏输入 `/actions/runs/<id>/artifacts/<artifact-id>` 回车自动下载 |
 
-## 8. 风险与合规声明
+## 9. 风险与合规声明
 
 - **违反 ToS**：批量注册 x.ai 账号违反 xAI 服务条款，账号随时可能被封禁。
 - **风控标记**：大多新账号带 botFlagSource 标记（本方案用开关跳过拦截，token 仍能正常换到并使用，但存在失效可能）。
