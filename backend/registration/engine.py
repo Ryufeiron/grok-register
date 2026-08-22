@@ -1370,6 +1370,12 @@ def ensure_sso_oauth_eligible(
                 state.get("bot_flag_details")
                 or f"botFlagSource={source},policy=unknown,event=unknown"
             )
+            if config.get("sso_allow_flagged", False):
+                _risk_log(
+                    f"检测到风控标记但已开启 sso_allow_flagged，继续 OAuth: "
+                    f"botFlagSource={source} {details}"
+                )
+                return state
             _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
             raise RegistrationRiskDenied(
                 "注册风控拒绝，已跳过 OAuth: "
