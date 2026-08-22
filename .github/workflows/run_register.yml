@@ -61,6 +61,7 @@ jobs:
             "email_provider": "duckmail",
             "duckmail_api_base": "https://api.mail.tm",
             "duckmail_api_key": "",
+            "proxy": "",
             "register_count": 1,
             "register_workers": 1,
             "browser_engine": "camoufox",
@@ -79,6 +80,8 @@ jobs:
             "close_browser_on_stop": True,
           }
           with open("data/config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, ensure_ascii=False, indent=2)
+          with open("config.json", "w", encoding="utf-8") as f:
               json.dump(cfg, f, ensure_ascii=False, indent=2)
           EOF
       - name: Start web
