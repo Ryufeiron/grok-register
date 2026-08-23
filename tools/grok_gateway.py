@@ -736,13 +736,30 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.dumps(bj).encode()
                     print("[gateway] FORCED non-stream", flush=True)
                 if tools_list and Handler.force_tool_choice and _empty_edit_streak < EMPTY_EDIT_LOOP_LIMIT:
-                    tc = bj.get("tool_choice")
-                    cur = tc.get("type") if isinstance(tc, dict) else str(tc)
-                    if cur != "required":
-                        old = json.dumps(tc)[:80] if tc is not None else "none"
-                        bj["tool_choice"] = "required"
-                        body = json.dumps(bj).encode()
-                        print(f"[gateway] FORCED tool_choice: {old} -> required", flush=True)
+                    has_tool_history = False
+                    conversation = bj.get("messages")
+                    if conversation is None:
+                        conversation = bj.get("input")
+                    if isinstance(conversation, list):
+                        for msg in conversation[:-1]:
+                            if not isinstance(msg, dict):
+                                continue
+                            if msg.get("tool_calls") or msg.get("tool_call_id"):
+                                has_tool_history = True
+                                break
+                    if has_tool_history:
+                        tc = bj.get("tool_choice")
+                        cur = tc.get("type") if isinstance(tc, dict) else str(tc)
+                        if cur != "required":
+                            old = json.dumps(tc)[:80] if tc is not None else "none"
+                            bj["tool_choice"] = "required"
+                            body = json.dumps(bj).encode()
+                            print(f"[gateway] FORCED tool_choice: {old} -> required (tool history detected)", flush=True)
+                    else:
+                        if isinstance(bj.get("tool_choice"), dict) or str(bj.get("tool_choice")) != "none":
+                            bj["tool_choice"] = "auto"
+                            body = json.dumps(bj).encode()
+                            print("[gateway] relaxed tool_choice -> auto (no tool history)", flush=True)
                 hdrs["Content-Length"] = str(len(body))
             except Exception as e:
                 print(f"[gateway] body not json: {e!r}", flush=True)
