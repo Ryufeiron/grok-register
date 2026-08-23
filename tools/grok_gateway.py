@@ -711,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
         if body is not None:
             hdrs["Content-Length"] = str(len(body))
         print(f"[gateway] body read len={0 if body is None else len(body)}", flush=True)
-        if body is not None and "/responses" in self.path:
+        if body is not None and ("/responses" in self.path or "/chat/completions" in self.path):
             try:
                 bj = json.loads(body)
                 print(f"[gateway] fwd-model={bj.get('model')} stream={bj.get('stream')} keys={list(bj.keys())[:12]} tools={len(bj.get('tools') or [])}", flush=True)
@@ -719,6 +719,8 @@ class Handler(BaseHTTPRequestHandler):
                 latest_tools = []
                 for tl_ in tools_list:
                     tname = tl_.get("name") if isinstance(tl_, dict) else None
+                    if not tname and isinstance(tl_, dict) and isinstance(tl_.get("function"), dict):
+                        tname = tl_["function"].get("name")
                     if tname:
                         latest_tools.append(tname)
                 # 优先 Bash 类工具（Claude Code 用 execute_bash / ExecuteBash / Bash / bash）
@@ -729,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                 _REQ_TOOLS["names"] = latest_tools
                 _REQ_TOOLS["bash_name"] = bs_name
-                if Handler.force_non_stream and bj.get("stream"):
+                if Handler.force_non_stream and bj.get("stream") and "/responses" in self.path:
                     bj["stream"] = False
                     body = json.dumps(bj).encode()
                     print("[gateway] FORCED non-stream", flush=True)
@@ -1045,7 +1047,7 @@ def main():
     ap.add_argument("--ban-seconds", type=int, default=300, help="429/401 后该 token 冷却秒数（默认 300）")
     ap.add_argument("--exhaust-ban-hours", type=float, default=24.0, help="免费额度耗尽(free-usage-exhausted)后冷却小时数（默认 24）")
     ap.add_argument("--force-tool-choice", action="store_true",
-                    help="带 tools 的 responses 请求强制 tool_choice=required（修复 grok free 不真调工具只输出文字）")
+                    help="带 tools 的 responses/chat 请求强制 tool_choice=required（修复 grok free 不真调工具只输出文字）")
     ap.add_argument("--filter-empty-edit", action="store_true",
                     help="过滤响应中的 old_string==new_string 的空 Edit 工具调用，替换为提示文本（防 Claude Code 编辑死循环）")
     ap.add_argument("--force-non-stream", action="store_true",
