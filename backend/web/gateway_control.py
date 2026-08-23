@@ -131,13 +131,16 @@ def gateway_status(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 def _gateway_process_active() -> bool:
     try:
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(
             [
                 "powershell", "-NoProfile", "-Command",
                 "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
                 "Where-Object { $_.CommandLine -like '*grok_gateway*' }).Count",
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, creationflags=flags,
         )
         return r.stdout.strip() == "1"
     except Exception:
@@ -194,6 +197,9 @@ def _spawn_gateway() -> bool:
 
 
 def _kill_gateway() -> None:
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW
     subprocess.run(
         [
             "powershell", "-NoProfile", "-Command",
@@ -201,7 +207,7 @@ def _kill_gateway() -> None:
             "Where-Object { $_.CommandLine -like '*grok_gateway*' } | "
             "ForEach-Object { taskkill /PID $_.ProcessId /F 2>$null }",
         ],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, creationflags=flags,
     )
 
 
@@ -256,8 +262,12 @@ def _run_daily(now: bool) -> None:
     summary = {"ok": False, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
         cmd = [sys.executable, str(DAILY_PY), "--now"]
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200,
-                           cwd=str(PROJECT_ROOT), encoding="utf-8", errors="replace")
+                           cwd=str(PROJECT_ROOT), encoding="utf-8", errors="replace",
+                           creationflags=flags)
         summary["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
         summary["returncode"] = r.returncode
         tail = (r.stdout or "")[-3000:].strip().splitlines()
