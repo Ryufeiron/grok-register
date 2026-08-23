@@ -3,6 +3,7 @@
 FROM node:22-bookworm-slim AS frontend-builder
 WORKDIR /build/front
 COPY front/package.json front/package-lock.json ./
+ENV NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
 RUN --mount=type=cache,target=/root/.npm npm ci
 COPY front/ ./
 RUN npm run build
@@ -12,6 +13,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ENV PATH=/opt/venv/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     XDG_CACHE_HOME=/opt/camoufox-cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

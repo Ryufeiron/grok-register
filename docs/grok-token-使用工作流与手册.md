@@ -370,7 +370,16 @@ api_backend = "responses"
 | 网关 502 "Bad Gateway" | token 过期或网络不通；换 token 重启网关 |
 | 客户端 404 但 curl 网关正常 | 客户端请求路径带了 `/v1/v1`，cc-switch 会自动去重；直连 opencode 时 baseURL 不要带 `/v1` 后缀之外的重复段 |
 | response_format/stream 报错 | grok 4.6 responses 不支持部分参数；可改 model 为 grok-4.5 + chat 端点 |
-| 想自动续期 | 网关暂不轮换 token；接入本平台的 refresh 逻辑（backend/integrations/auth_exchange.py）可定时刷新后重启网关 |
+| 想自动续期 | 网关暂不自动刷新 token；接入本平台的 refresh 逻辑（backend/integrations/auth_exchange.py）可定时刷新后重启网关 |
+| **流式请求 upstream 200 但 Claude Code 一直 "Waiting for API response" / "Stream error: error decoding response body"**（已实测修复） | 旧版网关把上游 SSE 原样转发却**没有声明响应边界**（无 Content-Length / 无 chunked / 未置 `Connection: close`），大请求或第二次请求时客户端读不到流结尾。**升级 grok_gateway.py 到含 `Connection: close` + 上游 EOF 后关闭的版本**（commit 之后版本），SSE 结束后客户端立即收到完整流 |
+| **上游返回 Cloudflare 400 Bad Request HTML**（已实测修复） | 客户端（cc-switch）注入的小写 `authorization` 头 + 网关注入的大写 `Authorization` 头**重复**导致 CF 拒绝。**升级网关**：转发时剔除大小写所有 `authorization`/`user-agent`/版本头，统一由网关注入 |
+| **401 "Invalid or expired credentials (... no auth context)"**（已实测修复） | 走 cc-switch 时其 API Key 被透传为 Bearer；旧版网关会再叠一层导致冲突。升级网关后客户端 key 填任意占位即可，网关负责注入真实 token |
+
+**cc-switch 侧注意（实测要点）**：
+
+- 在 cc-switch 运行中改数据库（`C:\Users\fr_li\.cc-switch\cc-switch.db`）`providers.settings_config` 的 `ANTHROPIC_AUTH_TOKEN` 为真实 token 会**立即生效**；但**重启 cc-switch 时活动文件会反填覆盖数据库**，注意顺序。
+- Claude provider 的 **Advanced → API Format 必须选 "OpenAI Responses"**，否则 cc-switch 按 Anthropic 原生格式直发上游路径，grok 不认。
+- 实测配置：Base URL `http://127.0.0.1:40200/v1`，API Key 任意非空占位（网关会覆盖），`response.completed` 事件 3.4s 内收到、流式完整返回。
 
 ## 7. 关键配置项说明
 

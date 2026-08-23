@@ -107,28 +107,62 @@ def ban_token(token, seconds):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *args):
+        print(f"[gateway] {self.command} {self.path} <- {self.headers.get('User-Agent','')[:60]}", flush=True)
 
     def _proxy(self, method):
         path = self.path
+        print(f"[gateway] req {method} {path} te={self.headers.get('Transfer-Encoding','-')} cl={self.headers.get('Content-Length','-')}", flush=True)
+        for hk, hv in self.headers.items():
+            print(f"[gateway]   H {hk}: {hv[:80]}", flush=True)
         if path.startswith("/v1/"):
             path = path[len("/v1"):]
         url = Handler.upstream + path
         parsed = urlsplit(url)
         assert parsed.scheme == "https", "upstream must be https"
         ctx = ssl.create_default_context()
-        conn = http.client.HTTPSConnection(parsed.hostname, 443, context=ctx, timeout=300)
-        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length", "connection")}
+        conn = http.client.HTTPSConnection(parsed.hostname, 443, context=ctx, timeout=60)
+        hdrs = {k: v for k, v in self.headers.items()
+                if k.lower() not in ("host", "content-length", "connection",
+                                     "authorization", "x-grok-client-version",
+                                     "x-grok-client-identifier", "user-agent")}
         hdrs["x-grok-client-version"] = GROK_VERSION
         hdrs["x-grok-client-identifier"] = "grok-pager"
-        hdrs["User-Agent"] = hdrs.get("User-Agent") or f"grok-pager/{GROK_VERSION} (gateway)"
+        hdrs["User-Agent"] = f"grok-pager/{GROK_VERSION} (gateway)"
         body = None
         if "Content-Length" in self.headers:
             try:
                 body = self.rfile.read(int(self.headers["Content-Length"]))
             except Exception:
                 body = None
+        try:
+            te = self.headers.get("Transfer-Encoding", "").lower()
+        except Exception:
+            te = ""
+        if body is None and te == "chunked":
+            try:
+                body = b""
+                while True:
+                    size_line = self.rfile.readline()
+                    if not size_line:
+                        break
+                    size = int(size_line.split(b";")[0].strip(), 16)
+                    if size == 0:
+                        self.rfile.readline()
+                        break
+                    body += self.rfile.read(size)
+                    self.rfile.readline()
+            except Exception:
+                body = None
+        if body is not None:
+            hdrs["Content-Length"] = str(len(body))
+        print(f"[gateway] body read len={0 if body is None else len(body)}", flush=True)
+        if body is not None and "/responses" in self.path:
+            try:
+                bj = json.loads(body)
+                print(f"[gateway] fwd-model={bj.get('model')} stream={bj.get('stream')} keys={list(bj.keys())[:12]} tools={len(bj.get('tools') or [])}", flush=True)
+            except Exception as e:
+                print(f"[gateway] body not json: {e!r}", flush=True)
 
         used_tokens = set()
         status = None
@@ -161,15 +195,32 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in resp.getheaders():
                     if k.lower() not in del_h:
                         self.send_header(k, v)
+                self.send_header("Connection", "close")
                 self.end_headers()
-                chunk = resp.read(65536)
+                self.close_connection = True
+                t_start = time.time()
+                print(f"[gateway] -> upstream status {status} for {self.command} {self.path} token {label}", flush=True)
+                resp_body = b""
+                chunk = resp.read1(65536)
                 while chunk:
+                    resp_body += chunk
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                    chunk = resp.read(65536)
+                    if b'[DONE]' in chunk:
+                        print(f"[gateway] SSE [DONE] seen after {time.time()-t_start:.1f}s", flush=True)
+                    if b'response.completed' in chunk:
+                        print(f"[gateway] response.completed seen at {time.time()-t_start:.1f}s", flush=True)
+                    chunk = resp.read1(65536)
+                print(f"[gateway] upstream body EOF after {time.time()-t_start:.1f}s total, resp_rcvd={len(resp_body)}", flush=True)
+                try:
+                    with open(r'C:\Users\fr_li\AppData\Local\Temp\opencode\gw_last_body.bin', 'wb') as fb:
+                        fb.write(resp_body)
+                except Exception:
+                    pass
                 conn.close()
                 return
             except Exception as e:
+                print(f"[gateway] ERROR {self.command} {self.path}: {e!r}", flush=True)
                 try:
                     self._reply(502, {"error": {"message": f"gateway error: {e}"}})
                 except Exception:
