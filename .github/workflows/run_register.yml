@@ -68,7 +68,7 @@ jobs:
             "duckmail_api_base": "https://api.mail.tm",
             "duckmail_api_key": "",
             "proxy": "",
-            "register_count": 4,
+            "register_count": 16,
             "register_workers": 1,
             "browser_engine": "camoufox",
             "browser_headless": False,
