@@ -162,6 +162,7 @@ def _spawn_gateway() -> bool:
         "--ban-seconds", "90",
         "--force-tool-choice",
         "--filter-empty-edit",
+        "--force-non-stream",
         "--control-port", str(CONTROL_PORT),
     ]
     try:
@@ -255,7 +256,8 @@ def _run_daily(now: bool) -> None:
     summary = {"ok": False, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
         cmd = [sys.executable, str(DAILY_PY), "--now"]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, cwd=str(PROJECT_ROOT))
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200,
+                           cwd=str(PROJECT_ROOT), encoding="utf-8", errors="replace")
         summary["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
         summary["returncode"] = r.returncode
         tail = (r.stdout or "")[-3000:].strip().splitlines()
@@ -264,10 +266,10 @@ def _run_daily(now: bool) -> None:
         summary["stderr_tail"] = tail_err[-10:]
         summary["ok"] = r.returncode == 0
         summary["duration_s"] = int(time.time() - started)
-    except Exception as exc:
-        summary["error"] = repr(exc)
     except subprocess.TimeoutExpired:
         summary["error"] = "timeout(7200s)"
+    except Exception as exc:
+        summary["error"] = repr(exc)
     with _TASK["lock"]:
         _TASK["running"] = False
         _TASK["last_result"] = summary

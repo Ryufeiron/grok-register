@@ -8,7 +8,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,7 +131,7 @@ jobs:
           last_log_id = 0
           last_snap = []
           t0 = time.time()
-          for i in range(210):
+          for i in range(300):
               out = subprocess.run(['curl', '-s', '-b', '/tmp/cookies.txt', 'http://127.0.0.1:8787/api/job/logs'], capture_output=True, text=True).stdout
               j = None
               try:

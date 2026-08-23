@@ -15,15 +15,12 @@ daily_grok_token_free.py
 import argparse
 import json
 import os
-import re
-import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
-import zipfile
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -98,14 +95,15 @@ def trigger_workflow(branch="main"):
         log(f"push failed: {err}")
         return None
     log("pushed empty commit, waiting for register run to appear")
-    for _ in range(12):
+    acceptable = {"queued", "waiting", "pending", "requested", "in_progress"}
+    for _ in range(18):
         time.sleep(10)
         now = api("/actions/runs?per_page=6")
         if now and now["workflow_runs"]:
             for r in now["workflow_runs"]:
                 if r.get("name") == "Run Register Probe" and r.get("event") == "push" \
-                        and r.get("status") == "in_progress":
-                    log(f"register run found: id={r['id']}")
+                        and r.get("status") in acceptable:
+                    log(f"register run found: id={r['id']} status={r['status']}")
                     return r["id"]
     log("no register run detected")
     return None
@@ -127,47 +125,50 @@ def wait_run(run_id, timeout=4200):
 
 
 def fetch_artifacts(run_id, token, dest_dir):
-    """用 gh CLI 下载 run 的 register-artifacts 到 dest_dir，返回 [(name, zip_path), ...]"""
+    """用 gh CLI 下载 run 的 register-artifacts 到 dest_dir。
+
+    gh run download 会将 artifact **解压**到 -D 目录（不产生 zip），
+    返回找到的 xai-*.json 文件路径列表。
+    """
     gh = os.environ.get("GRK_GH_EXE") or "gh"
     env = dict(os.environ)
     if token and not env.get("GH_TOKEN"):
         env["GH_TOKEN"] = token
     os.makedirs(dest_dir, exist_ok=True)
-    saved = []
     try:
         r = subprocess.run(
-            [gh, "run", "download", str(run_id), "-R", FORK, "-n", "register-artifacts", "-D", dest_dir],
+            [gh, "run", "download", str(run_id), "-R", FORK, "-n", "register-artifacts",
+             "-D", dest_dir],
             capture_output=True, text=True, timeout=600, env=env,
         )
         if r.returncode != 0:
             log(f"gh run download failed: rc={r.returncode} err={r.stderr[-500:]}")
-            return saved
+            return []
     except Exception as e:
         log(f"gh run download error: {e!r}")
-        return saved
+        return []
+    token_files = []
     for root, _dirs, files in os.walk(dest_dir):
         for fname in files:
-            if fname.endswith(".zip"):
-                saved.append(("register-artifacts", os.path.join(root, fname)))
-    log(f"artifact download ok: {len(saved)} zip(s)")
-    return saved
+            if fname.startswith("xai-") and fname.endswith(".json") and "cpa_auth" in root.replace("\\", "/"):
+                token_files.append(os.path.join(root, fname))
+    log(f"artifact download ok: {len(token_files)} token file(s)")
+    return token_files
 
 
-def collect_tokens_from_artifact(zip_path):
-    """在 zip 内找 data/cpa_auth/*.json，返回 [(email, token_json_dict), ...]"""
+def collect_tokens_from_files(paths):
+    """读取解压出的 cpa_auth/*.json 文件，返回 {email: token_dict}。"""
     found = {}
-    try:
-        with zipfile.ZipFile(zip_path) as z:
-            for n in z.namelist():
-                m = re.search(r"/data/cpa_auth/(xai-[^/]+\.json)$", n)
-                if m:
-                    data = json.loads(z.read(n).decode("utf-8"))
-                    email = data.get("email") or m.group(1)
-                    if data.get("access_token"):
-                        found[email] = data
-        log(f"{zip_path}: found {len(found)} tokens")
-    except Exception as e:
-        log(f"zip parse {zip_path} failed: {e!r}")
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("access_token"):
+                email = data.get("email") or os.path.basename(p)
+                found[email] = data
+        except Exception as e:
+            log(f"token file parse failed {p}: {e!r}")
+    log(f"collected {len(found)} valid token(s) from {len(paths)} file(s)")
     return found
 
 
@@ -228,34 +229,53 @@ def merge_tokens(token_dir, new_tokens):
 
 
 def restart_gateway():
-    """杀掉旧 gateway 进程并用标准参数重启。"""
-    ps = subprocess.run([
+    """杀掉旧 gateway 进程并用完整参数重启（Popen 方式，避免 PowerShell 重定向阻塞）。"""
+    subprocess.run([
         "powershell", "-NoProfile", "-Command",
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
         "Where-Object { $_.CommandLine -like '*grok_gateway*' } | "
         "ForEach-Object { taskkill /PID $_.ProcessId /F 2>$null }"],
         capture_output=True, text=True, timeout=60)
     time.sleep(2)
-    gw_log = os.path.join(tempfile.gettempdir(), "opencode", "gw.log")
-    gw_err = os.path.join(tempfile.gettempdir(), "opencode", "gw_err.log")
+    gw_log = os.path.join(REPO_DIR, "data", "gw.log")
+    gw_err = os.path.join(REPO_DIR, "data", "gw_err.log")
     try:
-        os.makedirs(os.path.dirname(gw_log), exist_ok=True)
-    except Exception:
-        pass
-    args = f"'python' '-u' '{GATEWAY_PY}' '--token-dir' '{TOKEN_DIR}' '--port' '{PORT}' '--ban-seconds' '90' '--force-tool-choice' '--filter-empty-edit'"
-    ps2 = subprocess.run([
-        "powershell", "-NoProfile", "-Command",
-        f"Start-Process python -ArgumentList {args} -WindowStyle Hidden "
-        f"-RedirectStandardOutput '{gw_log}' -RedirectStandardError '{gw_err}'"],
-        capture_output=True, text=True, timeout=60)
-    time.sleep(5)
-    # 验证监听
-    r = subprocess.run(["powershell", "-NoProfile", "-Command",
-                        f"(Get-NetTCPConnection -LocalPort {PORT} -State Listen -ErrorAction SilentlyContinue).Count"],
-                       capture_output=True, text=True, timeout=30)
-    listening = r.stdout.strip() == "1"
-    log(f"gateway restarted, listening={listening}")
-    return listening
+        out_f = open(gw_log, "ab", buffering=0)
+        err_f = open(gw_err, "ab", buffering=0)
+    except Exception as e:
+        log(f"open gateway log failed: {e!r}")
+        return False
+    cmd = [
+        sys.executable, "-u", GATEWAY_PY,
+        "--token-dir", TOKEN_DIR,
+        "--port", str(PORT),
+        "--ban-seconds", "90",
+        "--force-tool-choice",
+        "--filter-empty-edit",
+        "--force-non-stream",
+        "--control-port", "40201",
+    ]
+    try:
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
+        subprocess.Popen(cmd, cwd=REPO_DIR, stdout=out_f, stderr=err_f,
+                         close_fds=True, creationflags=flags)
+    except Exception as e:
+        log(f"spawn gateway failed: {e!r}")
+        return False
+    # 验证控制端口
+    for _ in range(15):
+        time.sleep(1)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:40201/status", timeout=2) as resp:
+                if resp.status == 200:
+                    log("gateway restarted, control port OK")
+                    return True
+        except Exception:
+            pass
+    log("gateway restarted, but control port not responding")
+    return False
 
 
 def main():
@@ -296,17 +316,15 @@ def main():
 
     # 3. 下载 artifact
     tmp = tempfile.mkdtemp(prefix="daily_token_")
-    arts = fetch_artifacts(run_id, token, tmp) if token else []
-    if not arts:
-        log("no artifacts downloaded")
+    token_files = fetch_artifacts(run_id, token, tmp) if token else []
+    if not token_files:
+        log("no token files downloaded from artifact")
         return 1
 
     # 4. 合并 token
-    new_tokens = {}
-    for name, zp in arts:
-        new_tokens.update(collect_tokens_from_artifact(zp))
+    new_tokens = collect_tokens_from_files(token_files)
     if not new_tokens:
-        log("no valid tokens found in artifacts")
+        log("no valid tokens found in artifact files")
         return 1
     added = merge_tokens(TOKEN_DIR, new_tokens)
     sync_account_files(os.path.join(REPO_DIR, "data", "accounts"), TOKEN_DIR)
