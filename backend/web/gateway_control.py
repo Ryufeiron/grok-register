@@ -98,6 +98,10 @@ def gateway_status(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 "count_429": t.get("count_429", 0),
                 "count_401": t.get("count_401", 0),
                 "count_ok": t.get("count_ok", 0),
+                "quota_remaining": t.get("quota_remaining"),
+                "quota_actual": t.get("quota_actual"),
+                "quota_limit": t.get("quota_limit"),
+                "quota_updated_at": t.get("quota_updated_at"),
             })
     total = len(tokens)
     rate = (healthy / total) if total else 0.0
@@ -272,7 +276,49 @@ def _run_daily(now: bool) -> None:
 
 def _task_snapshot() -> Dict[str, Any]:
     with _TASK["lock"]:
-        return {
+        snap = {
             "running": bool(_TASK["running"]),
             "last_result": _TASK["last_result"],
         }
+    if not snap["running"]:
+        snap["actions"] = _actions_run_status()
+    return snap
+
+
+# ------------- GitHub Actions run 状态查询（本地任务丢失时的兜底展示） -------------
+
+ACTIONS_API = "https://api.github.com/repos/Ryufeiron/grok-register/actions/runs"
+RUN_NAME = "Run Register Probe"
+_actions_cache: Dict[str, Any] = {"at": 0.0, "data": None}
+
+
+def _actions_run_status() -> Optional[Dict[str, Any]]:
+    now = time.time()
+    if _actions_cache["data"] is not None and now - _actions_cache["at"] < 10:
+        return _actions_cache["data"]
+    result = None
+    try:
+        req = urllib.request.Request(
+            ACTIONS_API + "?per_page=10",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "grok-register-web"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        for run in data.get("workflow_runs", []):
+            if run.get("name") != RUN_NAME:
+                continue
+            result = {
+                "run_id": run.get("id"),
+                "status": run.get("status"),          # queued / in_progress / completed
+                "conclusion": run.get("conclusion"),  # success / failure / null
+                "created_at": run.get("created_at"),
+                "updated_at": run.get("updated_at"),
+                "html_url": run.get("html_url"),
+                "source": "github_actions",
+            }
+            break
+    except Exception as exc:
+        _log(f"query actions status failed: {exc!r}")
+    _actions_cache["at"] = now
+    _actions_cache["data"] = result
+    return result

@@ -28,6 +28,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
@@ -35,6 +36,67 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+# ---------- 极速优化：连接池 + SSL 上下文复用 + TCP_NODELAY ----------
+_SSL_CTX = ssl.create_default_context()
+_CONN_POOL = []                    # 空闲上游连接池（TLS keep-alive 复用）
+_CONN_POOL_LOCK = threading.Lock()
+_CONN_POOL_MAX = 16
+_VERBOSE = bool(os.environ.get("GROK_GATEWAY_VERBOSE"))   # 逐头日志开关
+_DUMP_BODY = bool(os.environ.get("GROK_GATEWAY_DUMP"))    # 响应落盘开关（调试用）
+
+
+class _FastHTTPS(http.client.HTTPSConnection):
+    """上游连接：TCP_NODELAY（消除 Nagle 40ms 延迟）。"""
+
+    def connect(self):
+        super().connect()
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+
+def _acquire_conn(host):
+    """从池中取空闲连接，没有则新建（省去重复 TLS 握手）。"""
+    with _CONN_POOL_LOCK:
+        while _CONN_POOL:
+            c = _CONN_POOL.pop()
+            if getattr(c, "host", None) == host:
+                return c
+            try:
+                c.close()
+            except Exception:
+                pass
+    return _FastHTTPS(host, 443, context=_SSL_CTX, timeout=180)
+
+
+def _release_conn(conn):
+    """响应读完的连接放回池复用；池满则关闭。"""
+    try:
+        with _CONN_POOL_LOCK:
+            if len(_CONN_POOL) < _CONN_POOL_MAX:
+                _CONN_POOL.append(conn)
+                return
+        conn.close()
+    except Exception:
+        pass
+
+
+def _send_upstream(conn, host, method, path, body, hdrs):
+    """发送请求；池中旧连接若已被上游断开则自动换新重发一次。"""
+    try:
+        conn.request(method, path, body=body, headers=hdrs)
+        return conn, conn.getresponse()
+    except (http.client.RemoteDisconnected, ConnectionResetError,
+            BrokenPipeError, ssl.SSLError, OSError):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = _FastHTTPS(host, 443, context=_SSL_CTX, timeout=180)
+        conn.request(method, path, body=body, headers=hdrs)
+        return conn, conn.getresponse()
 
 DEFAULT_UPSTREAM = "https://cli-chat-proxy.grok.com/v1"
 GROK_VERSION = "0.1.202"
@@ -51,6 +113,8 @@ QUOTA_LIMIT = 500000
 QUOTA_EXHAUSTED_THRESHOLD = 0
 PROBE_MIN_INTERVAL = 1800  # 自愈探测最小间隔（秒），防止风暴反复锁死
 QUOTA_STATE_FILE = None   # 额度状态持久化文件（main 设置，如 data/quota_state.json）
+_quota_last_save = 0.0
+QUOTA_SAVE_INTERVAL = 30.0  # quota state disk-flush throttle (seconds)
 _REQ_TOOLS = {"names": [], "bash_name": None}   # 最近一次请求的工具名（多线程由 GIL 保护，可接受）
 EMPTY_EDIT_LOOP_LIMIT = 3                        # 连续空 Edit 次数阈值，超过后解除 FORCED 破环
 _empty_edit_streak = 0                           # 当前连续空 Edit 计数
@@ -296,7 +360,7 @@ def pick_token():
                 best_idx = i
         if best_idx < 0:
             # 全池无可用 token：兜底重置一个过期探测 token（每请求最多 1 个，30min/个）
-            if self_heal_done_this_pass and self_heal_candidate is not None:
+            if self_heal_candidate is not None:
                 i = self_heal_candidate
                 label = _token_pool[i][1]
                 _quota_update(label, QUOTA_LIMIT)
@@ -321,10 +385,14 @@ def _quota_get(label):
     return QUOTA_LIMIT
 
 
-def _quota_save():
+def _quota_save(force=False):
     try:
         if not QUOTA_STATE_FILE:
             return
+        now = time.time()
+        if not force and _quota_last_save and now - _quota_last_save < QUOTA_SAVE_INTERVAL:
+            return
+        _quota_last_save = now
         tmp = QUOTA_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_quota_est, f, ensure_ascii=False, indent=2)
@@ -584,6 +652,8 @@ def _filter_empty_edit_raw(raw_response):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True   # 客户端侧 TCP_NODELAY：流式块即时推送
+    wbufsize = 65536                 # 写缓冲，减少 syscall
     upstream = DEFAULT_UPSTREAM
     ban_seconds = 300
     token_dir = ""
@@ -597,15 +667,15 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy(self, method):
         path = self.path
         print(f"[gateway] req {method} {path} te={self.headers.get('Transfer-Encoding','-')} cl={self.headers.get('Content-Length','-')}", flush=True)
-        for hk, hv in self.headers.items():
-            print(f"[gateway]   H {hk}: {hv[:80]}", flush=True)
+        if _VERBOSE:
+            for hk, hv in self.headers.items():
+                print(f"[gateway]   H {hk}: {hv[:80]}", flush=True)
         if path.startswith("/v1/"):
             path = path[len("/v1"):]
         url = Handler.upstream + path
         parsed = urlsplit(url)
         assert parsed.scheme == "https", "upstream must be https"
-        ctx = ssl.create_default_context()
-        conn = http.client.HTTPSConnection(parsed.hostname, 443, context=ctx, timeout=60)
+        conn = _acquire_conn(parsed.hostname)
         hdrs = {k: v for k, v in self.headers.items()
                 if k.lower() not in ("host", "content-length", "connection",
                                      "authorization", "x-grok-client-version",
@@ -695,7 +765,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply_429(retry_after)
                 else:
                     self._reply(429, {"error": {"message": "all tokens throttled or expired"}})
-                conn.close()
+                _release_conn(conn)
                 return
             token, label = picked
             if token in used_tokens:
@@ -704,8 +774,7 @@ class Handler(BaseHTTPRequestHandler):
             hdrs_ = dict(hdrs)
             hdrs_["Authorization"] = "Bearer " + token
             try:
-                conn.request(method, parsed.path, body=body, headers=hdrs_)
-                resp = conn.getresponse()
+                conn, resp = _send_upstream(conn, parsed.hostname, method, parsed.path, body, hdrs_)
                 status = resp.status
                 if status in (429,):
                     body_429 = b""
@@ -752,7 +821,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "retry_after": max_cooldown,
                             },
                         })
-                        conn.close()
+                        _release_conn(conn)
                         return
                     else:
                         ra = resp.getheader("Retry-After")
@@ -823,22 +892,30 @@ class Handler(BaseHTTPRequestHandler):
                 if upstream_ce and upstream_ce.lower() == "gzip":
                     import gzip as _gz
                     stream_gz = _gz.GzipFile(fileobj=resp)
-                chunk = (stream_gz.read1(65536) if stream_gz else resp.read1(65536)) or b""
+                acc = _DUMP_BODY   # SSE 流不累积全量体（省内存拷贝）；JSON 响应用于 usage 解析
+                chunk = (stream_gz.read1(262144) if stream_gz else resp.read1(262144)) or b""
                 while chunk:
-                    resp_body += chunk
+                    if not acc and not resp_body and chunk[:1] == b"{":
+                        acc = True
+                    if acc:
+                        resp_body += chunk
                     if b'[DONE]' in chunk:
                         print(f"[gateway] SSE [DONE] seen after {time.time()-t_start:.1f}s", flush=True)
                     if b'response.completed' in chunk:
                         print(f"[gateway] response.completed seen at {time.time()-t_start:.1f}s", flush=True)
                     try:
-                        self.wfile.write(b"%x\r\n" % len(chunk))
-                        self.wfile.write(chunk)
-                        self.wfile.write(b"\r\n")
+                        self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                         self.wfile.flush()
                     except Exception as e:
                         print(f"[gateway] stream write aborted after {time.time()-t_start:.1f}s: {e!r}", flush=True)
                         break
-                    chunk = (stream_gz.read1(65536) if stream_gz else resp.read1(65536)) or b""
+                    chunk = (stream_gz.read1(262144) if stream_gz else resp.read1(262144)) or b""
+                try:
+                    # 排空剩余上游数据（写中断时防止污染连接池复用）
+                    while (stream_gz.read1(262144) if stream_gz else resp.read1(262144)):
+                        pass
+                except Exception:
+                    pass
                 try:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
@@ -853,12 +930,13 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 except Exception:
                     pass
-                try:
-                    with open(r'C:\Users\fr_li\AppData\Local\Temp\opencode\gw_last_body.bin', 'wb') as fb:
-                        fb.write(resp_body)
-                except Exception:
-                    pass
-                conn.close()
+                if _DUMP_BODY:
+                    try:
+                        with open(r'C:\Users\fr_li\AppData\Local\Temp\opencode\gw_last_body.bin', 'wb') as fb:
+                            fb.write(resp_body)
+                    except Exception:
+                        pass
+                _release_conn(conn)
                 return
             except Exception as e:
                 print(f"[gateway] ERROR {self.command} {self.path}: {e!r}", flush=True)
@@ -1014,12 +1092,21 @@ def main():
     Handler.port = args.port
     with _stats_lock:
         _stats["started_at"] = time.time()
+    ThreadingHTTPServer.request_queue_size = 128   # 并发 agent 请求排队容量
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     if args.control_port:
         from threading import Thread
         ctl = ThreadingHTTPServer(("127.0.0.1", args.control_port), ControlHandler)
         Thread(target=ctl.serve_forever, daemon=True).start()
         print(f"[gateway] control api on http://127.0.0.1:{args.control_port}/status", flush=True)
+
+    def _flush_loop():
+        while True:
+            time.sleep(60)
+            with _pool_lock:
+                _quota_save(force=True)
+
+    Thread(target=_flush_loop, daemon=True).start()
     print(f"grok gateway listening on http://127.0.0.1:{args.port} -> {Handler.upstream}", flush=True)
     print(f"tokens: {[lb for _, lb, _, _ in entries]}", flush=True)
     srv.serve_forever()

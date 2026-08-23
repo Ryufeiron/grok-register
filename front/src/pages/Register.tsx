@@ -617,6 +617,32 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   {gwTask?.running ? "注册进行中…" : "注册新 Token"}
                 </Button>
               </div>
+              {!gwTask?.running && gwTask?.actions ? (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                  <span>GitHub Actions 最近任务</span>
+                  <Badge
+                    variant={
+                      gwTask.actions.status === "completed"
+                        ? gwTask.actions.conclusion === "success"
+                          ? "success"
+                          : "destructive"
+                        : "secondary"
+                    }
+                  >
+                    {gwTask.actions.status === "in_progress"
+                      ? "运行中"
+                      : gwTask.actions.status === "completed"
+                        ? gwTask.actions.conclusion === "success"
+                          ? "已完成"
+                          : "失败"
+                        : "排队中"}
+                  </Badge>
+                  <span>run #{gwTask.actions.run_id}</span>
+                  {gwTask.actions.created_at ? (
+                    <span>· {gwTask.actions.created_at.replace("T", " ").slice(0, 19)}</span>
+                  ) : null}
+                </div>
+              ) : null}
 
               <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
                 <div className="flex items-center justify-between gap-2">
@@ -670,6 +696,77 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   <p className="mt-2 text-xs text-slate-500">网关控制接口不可用（需要新版后端）。</p>
                 )}
               </div>
+
+              {gwStatus && gwStatus.tokens && gwStatus.tokens.length > 0 ? (
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <div className="text-sm font-semibold text-slate-900">Token 额度明细</div>
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 text-slate-400">
+                          <th className="py-1.5 pr-3 font-medium">Token</th>
+                          <th className="py-1.5 pr-3 text-right font-medium">剩余额度</th>
+                          <th className="py-1.5 pr-3 text-right font-medium">实际/限额</th>
+                          <th className="py-1.5 pr-3 font-medium">状态</th>
+                          <th className="py-1.5 pr-3 text-right font-medium">OK/429</th>
+                          <th className="py-1.5 font-medium">刷新</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {gwStatus.tokens.map((token) => {
+                          const quotaRemaining = token.quota_remaining ?? 0;
+                          const quotaActual = token.quota_actual ?? quotaRemaining;
+                          const quotaLimit = token.quota_limit ?? 500000;
+                          const statusText = token.expired
+                            ? "过期"
+                            : token.cooling
+                              ? "冷却中"
+                              : "正常";
+                          const barPct =
+                            quotaLimit > 0
+                              ? Math.max(0, Math.min(100, Math.round((quotaRemaining / quotaLimit) * 100)))
+                              : 0;
+                          return (
+                            <tr key={token.label || Math.random()} className="border-b border-slate-100 last:border-0">
+                              <td className="py-1.5 pr-3 font-mono text-[11px] text-slate-600">
+                                {(token.label || "").split("@")[0]}
+                              </td>
+                              <td className="py-1.5 pr-3 text-right tabular-nums">
+                                {(quotaRemaining / 10000).toFixed(1)} 万
+                              </td>
+                              <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
+                                {Math.round(quotaActual / 1000)}k / {Math.round(quotaLimit / 1000)}k
+                                <div className="mt-0.5 ml-auto h-1 w-20 overflow-hidden rounded-full bg-slate-200">
+                                  <div
+                                    className={cn(
+                                      "h-full rounded-full",
+                                      barPct > 50 ? "bg-emerald-500" : barPct > 0 ? "bg-amber-500" : "bg-rose-500"
+                                    )}
+                                    style={{ width: `${barPct}%` }}
+                                  />
+                                </div>
+                              </td>
+                              <td className={cn("py-1.5 pr-3", token.expired ? "text-rose-600" : token.cooling ? "text-amber-600" : "text-emerald-600")}>
+                                {statusText}
+                              </td>
+                              <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
+                                {token.count_ok ?? 0}/{token.count_429 ?? 0}
+                              </td>
+                              <td className="py-1.5 text-slate-400">
+                                {token.has_refresh ? (
+                                  <span className="text-emerald-500">✓</span>
+                                ) : (
+                                  <span className="text-slate-300">—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : null}
 
               {gwTask?.last_result ? (
                 <div className="rounded-xl border border-slate-200 p-4 text-xs leading-6">

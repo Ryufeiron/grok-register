@@ -137,6 +137,10 @@ export type GatewayToken = {
   count_429: number;
   count_401: number;
   count_ok: number;
+  quota_remaining?: number | null;
+  quota_actual?: number | null;
+  quota_limit?: number | null;
+  quota_updated_at?: number | null;
 };
 
 export type GatewayTask = {
@@ -150,6 +154,15 @@ export type GatewayTask = {
     error?: string;
     stdout_tail?: string[];
     stderr_tail?: string[];
+  } | null;
+  actions?: {
+    run_id?: number;
+    status?: string;
+    conclusion?: string | null;
+    created_at?: string;
+    updated_at?: string;
+    html_url?: string;
+    source?: string;
   } | null;
 };
 
