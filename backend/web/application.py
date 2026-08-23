@@ -25,6 +25,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .account_exports import build_account_auth_archive, build_sso_archive, read_sso_token
+from .gateway_control import (
+    _task_snapshot as run_status,
+    gateway_status,
+    refresh_tokens,
+    register_now,
+    start_gateway,
+    stop_gateway,
+)
 from .jobs import job_coordinator
 from .relogin_jobs import relogin_coordinator
 from .sso_check_jobs import sso_check_coordinator
@@ -1494,6 +1502,42 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"终止浏览器失败: {exc}") from exc
         return {"ok": True, **result, "job": job_coordinator.status()}
+
+    @app.get("/api/gateway/status")
+    def api_gateway_status() -> Dict[str, Any]:
+        return gateway_status()
+
+    @app.post("/api/gateway/start")
+    def api_gateway_start() -> Dict[str, Any]:
+        result = start_gateway()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "网关启动失败"))
+        return result
+
+    @app.post("/api/gateway/stop")
+    def api_gateway_stop() -> Dict[str, Any]:
+        result = stop_gateway()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail="网关停止失败")
+        return result
+
+    @app.post("/api/gateway/refresh")
+    def api_gateway_refresh() -> Dict[str, Any]:
+        result = refresh_tokens()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "刷新失败"))
+        return result
+
+    @app.post("/api/gateway/register")
+    def api_gateway_register() -> Dict[str, Any]:
+        result = register_now()
+        if not result.get("ok") and result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+
+    @app.get("/api/gateway/register/status")
+    def api_gateway_register_status() -> Dict[str, Any]:
+        return {"ok": True, "task": run_status()}
 
     @app.api_route("/api/connectivity", methods=["GET", "POST"])
     def api_connectivity() -> Dict[str, Any]:

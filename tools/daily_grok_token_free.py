@@ -127,24 +127,29 @@ def wait_run(run_id, timeout=4200):
 
 
 def fetch_artifacts(run_id, token, dest_dir):
-    """下载 run 的所有 artifact 到 dest_dir，返回 [(name, zip_path), ...]"""
-    out = api(f"/actions/runs/{run_id}/artifacts", token=token)
-    if not out:
-        return []
-    arts = out.get("artifacts", [])
+    """用 gh CLI 下载 run 的 register-artifacts 到 dest_dir，返回 [(name, zip_path), ...]"""
+    gh = os.environ.get("GRK_GH_EXE") or "gh"
+    env = dict(os.environ)
+    if token and not env.get("GH_TOKEN"):
+        env["GH_TOKEN"] = token
+    os.makedirs(dest_dir, exist_ok=True)
     saved = []
-    for a in arts:
-        url = f"https://api.github.com/repos/{FORK}/actions/artifacts/{a['id']}/zip"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
-                                                   "User-Agent": "daily-grok-token"})
-        zip_path = os.path.join(dest_dir, f"art_{a['id']}.zip")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:
-                f.write(resp.read())
-            saved.append((a["name"], zip_path))
-            log(f"artifact {a['name']} ({a['size_in_bytes']}B) -> {zip_path}")
-        except Exception as e:
-            log(f"artifact download {a['name']} failed: {e!r}")
+    try:
+        r = subprocess.run(
+            [gh, "run", "download", str(run_id), "-R", FORK, "-n", "register-artifacts", "-D", dest_dir],
+            capture_output=True, text=True, timeout=600, env=env,
+        )
+        if r.returncode != 0:
+            log(f"gh run download failed: rc={r.returncode} err={r.stderr[-500:]}")
+            return saved
+    except Exception as e:
+        log(f"gh run download error: {e!r}")
+        return saved
+    for root, _dirs, files in os.walk(dest_dir):
+        for fname in files:
+            if fname.endswith(".zip"):
+                saved.append(("register-artifacts", os.path.join(root, fname)))
+    log(f"artifact download ok: {len(saved)} zip(s)")
     return saved
 
 
@@ -164,6 +169,37 @@ def collect_tokens_from_artifact(zip_path):
     except Exception as e:
         log(f"zip parse {zip_path} failed: {e!r}")
     return found
+
+
+def sync_account_files(acct_dir, token_dir):
+    """把 cpa_auth 里每个 token 对应的账号文件对齐到 data/accounts/ 目录。
+
+    本地已有 data/accounts/*.txt 若与 cpa_auth token 邮箱一致则跳过；
+    缺失的从 cpa_auth JSON（含 email/sso）生成，保证平台账号库可补录。
+    """
+    created = []
+    os.makedirs(acct_dir, exist_ok=True)
+    for name in sorted(os.listdir(token_dir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            data = json.load(open(os.path.join(token_dir, name), encoding="utf-8"))
+        except Exception:
+            continue
+        email = str(data.get("email") or "").strip()
+        if not email or "@" not in email:
+            continue
+        acct_file = os.path.join(acct_dir, f"{email}.txt")
+        if os.path.isfile(acct_file):
+            continue
+        password = str(data.get("password") or "generated-unsaved")
+        sso = str(data.get("sso") or "")
+        with open(acct_file, "w", encoding="utf-8") as f:
+            f.write(f"{email}----{password}----{sso}\n")
+        created.append(email)
+    if created:
+        log(f"sync_account_files: created {len(created)} account file(s): {', '.join(e.split('@')[0] for e in created)}")
+    return created
 
 
 def merge_tokens(token_dir, new_tokens):
@@ -206,7 +242,7 @@ def restart_gateway():
         os.makedirs(os.path.dirname(gw_log), exist_ok=True)
     except Exception:
         pass
-    args = f"'python' '-u' '{GATEWAY_PY}' '--token-dir' '{TOKEN_DIR}' '--port' '{PORT}' '--ban-seconds' '90' '--force-tool-choice'"
+    args = f"'python' '-u' '{GATEWAY_PY}' '--token-dir' '{TOKEN_DIR}' '--port' '{PORT}' '--ban-seconds' '90' '--force-tool-choice' '--filter-empty-edit'"
     ps2 = subprocess.run([
         "powershell", "-NoProfile", "-Command",
         f"Start-Process python -ArgumentList {args} -WindowStyle Hidden "
@@ -273,6 +309,7 @@ def main():
         log("no valid tokens found in artifacts")
         return 1
     added = merge_tokens(TOKEN_DIR, new_tokens)
+    sync_account_files(os.path.join(REPO_DIR, "data", "accounts"), TOKEN_DIR)
 
     # 5. 重启网关
     restart_gateway()

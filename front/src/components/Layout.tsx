@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { Activity, Database, LogOut, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, RefreshCw, X } from "lucide-react";
+import { Activity, Database, LogOut, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Play, RefreshCw, Square, X } from "lucide-react";
 import { mobilePrimaryItems, navigationGroups, navigationItems } from "@/app/navigation";
 import { UPDATE_SNAPSHOT_EVENT, UpdateNotice } from "@/components/UpdateNotice";
 import { Toast } from "@/components/ui";
-import { api } from "@/lib/api";
+import { api, GatewayStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function navigationActive(pathname: string, to: string) {
@@ -38,6 +38,100 @@ function Brand() {
         <div className="truncate text-sm font-semibold tracking-tight text-slate-950">Grok Register</div>
         <div className="truncate text-[11px] text-slate-500">账号与授权控制台</div>
       </div>
+    </div>
+  );
+}
+
+function GatewayControls() {
+  const [status, setStatus] = useState<GatewayStatus | null>(null);
+  const [busy, setBusy] = useState<"start" | "stop" | "refresh" | null>(null);
+  const [toast, setToast] = useState<{ message: string; tone: "success" | "error" }>({ message: "", tone: "success" });
+
+  const refreshStatus = async () => {
+    try {
+      const result = await api.gatewayStatus();
+      setStatus(result);
+    } catch {
+      setStatus(null);
+    }
+  };
+
+  useEffect(() => {
+    void refreshStatus();
+    const timer = window.setInterval(() => void refreshStatus(), 8000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!toast.message) return;
+    const timer = window.setTimeout(() => setToast((current) => ({ ...current, message: "" })), 4000);
+    return () => window.clearTimeout(timer);
+  }, [toast.message]);
+
+  const run = async (kind: "start" | "stop" | "refresh") => {
+    if (busy) return;
+    setBusy(kind);
+    try {
+      if (kind === "start") {
+        const result = await api.gatewayStart();
+        setToast({ message: result.already_running ? "网关已在运行" : "网关已启动", tone: "success" });
+      } else if (kind === "stop") {
+        const result = await api.gatewayStop();
+        setToast({ message: result.already_stopped ? "网关已停止" : "网关已停止运行", tone: "success" });
+      } else {
+        const result = await api.gatewayRefresh();
+        setToast({ message: result.ok ? "Token 池已刷新" : "Token 刷新失败", tone: result.ok ? "success" : "error" });
+      }
+    } catch (error) {
+      setToast({
+        message: error instanceof Error ? error.message : "网关操作失败",
+        tone: "error",
+      });
+    } finally {
+      setBusy(null);
+      void refreshStatus();
+    }
+  };
+
+  const running = Boolean(status?.running);
+  const total = status?.tokens_total ?? 0;
+  const healthy = status?.tokens_healthy ?? 0;
+  const warn = Boolean(status?.warn);
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <button
+        type="button"
+        onClick={() => void run(busy ? busy : running ? "stop" : "start")}
+        disabled={busy !== null}
+        className={cn(
+          "flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border px-2.5 font-medium",
+          running
+            ? "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+            : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+        )}
+        aria-label={running ? "停止网关" : "启动网关"}
+        title={
+          running
+            ? `停止网关（${healthy}/${total} 可用${warn ? "，可用率低" : ""}）`
+            : "启动网关（Token 代理 :40200）"
+        }
+      >
+        <span className={cn("h-1.5 w-1.5 rounded-full", running ? (warn ? "animate-pulse bg-amber-500" : "bg-emerald-500") : "bg-slate-300")} aria-hidden="true" />
+        <span className="hidden md:inline">{busy === "start" || busy === "stop" ? "处理中" : running ? "停止网关" : "启动网关"}</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => void run("refresh")}
+        disabled={busy !== null}
+        className="flex h-8 shrink-0 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2 font-medium text-slate-600 hover:bg-slate-50 hover:text-slate-950 disabled:cursor-wait disabled:opacity-60"
+        aria-label="刷新 Token"
+        title="刷新 Token 池（过期 Token 自动续期）"
+      >
+        <RefreshCw className={cn("h-3.5 w-3.5", busy === "refresh" && "animate-spin")} aria-hidden="true" />
+        <span className="hidden lg:inline">刷新池</span>
+      </button>
+      <Toast message={toast.message} tone={toast.tone} />
     </div>
   );
 }
@@ -195,6 +289,8 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
             <RefreshCw className={cn("h-3.5 w-3.5", checkingUpdate && "animate-spin")} aria-hidden="true" />
             <span className="hidden sm:inline">{checkingUpdate ? "检查中" : "检查更新"}</span>
           </button>
+          <span className="hidden text-slate-300" aria-hidden="true">|</span>
+          <GatewayControls />
           <span className="hidden sm:inline">本地控制台</span>
           <StatusPill running={jobRunning} compact />
         </div>

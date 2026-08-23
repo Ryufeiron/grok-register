@@ -127,6 +127,51 @@ export type AuthState = {
   username: string;
 };
 
+export type GatewayToken = {
+  label?: string;
+  has_refresh: boolean;
+  expired: boolean;
+  cooling: boolean;
+  cooldown_until?: number | null;
+  exp_ts?: number | null;
+  count_429: number;
+  count_401: number;
+  count_ok: number;
+};
+
+export type GatewayTask = {
+  running: boolean;
+  last_result?: {
+    ok?: boolean;
+    started?: string;
+    finished?: string;
+    returncode?: number;
+    duration_s?: number;
+    error?: string;
+    stdout_tail?: string[];
+    stderr_tail?: string[];
+  } | null;
+};
+
+export type GatewayStatus = {
+  ok: boolean;
+  running: boolean;
+  url?: string | null;
+  tokens_total: number;
+  tokens_healthy: number;
+  tokens_expired: number;
+  tokens_cooling: number;
+  healthy_rate: number;
+  warn: boolean;
+  warn_threshold: number;
+  tokens: GatewayToken[];
+  stats?: Record<string, unknown> | null;
+  upstream?: string | null;
+  port?: number | null;
+  gateway_active: boolean;
+  task: GatewayTask;
+};
+
 export type UpdateStatus = "unchecked" | "up_to_date" | "update_available" | "check_failed";
 
 export type VersionInfo = {
@@ -457,4 +502,19 @@ export const api = {
       "/api/connectivity",
       { method: "POST" }
     ),
+  gatewayStatus: () =>
+    request<{ ok: boolean } & GatewayStatus>("/api/gateway/status"),
+  gatewayStart: () =>
+    request<{ ok: boolean } & GatewayStatus>("/api/gateway/start", { method: "POST" }),
+  gatewayStop: () =>
+    request<{ ok: boolean; already_stopped?: boolean }>("/api/gateway/stop", { method: "POST" }),
+  gatewayRefresh: () =>
+    request<{ ok: boolean } & GatewayStatus>("/api/gateway/refresh", { method: "POST" }),
+  gatewayRegister: () =>
+    request<{ ok: boolean; already_running?: boolean; started?: boolean; task?: GatewayTask }>(
+      "/api/gateway/register",
+      { method: "POST" }
+    ),
+  gatewayRegisterStatus: () =>
+    request<{ ok: boolean; task: GatewayTask }>("/api/gateway/register/status"),
 };

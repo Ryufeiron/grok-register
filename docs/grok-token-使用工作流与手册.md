@@ -322,6 +322,11 @@ python tools/grok_gateway.py --token-dir data/cpa_auth --port 40200
 - 加载目录下所有含 `access_token` 的 JSON（如 `data/cpa_auth/xai-*.json`），启动时打印账号列表。
 - 请求按 round-robin 顺序自动轮换账号使用。
 - 收到 **429（限流）** 或 **401/403（token 失效）** 时自动把该 token 冷却 `--ban-seconds` 秒（默认 300s）并立即切换下一个 token 重试，客户端无感知。
+- **429 内部再识别 `free-usage-exhausted`（每日额度墙，见第 9 章）**：命中后按 `max_cooldown` 长冷却（约 24h），放掉短限流；全部 token 都不可用时返回 429 + Retry-After 提示。
+- **自动续期（已实现）**：请求前检测 JWT `exp`，过期即用 `refresh_token` 调 `auth.x.ai/oauth2/token` 换新 access_token 并**写回原 JSON 文件**，下次启动无需手动处理；每个 token 只要账号未被吊销即可永久循环续期。
+- **`--force-tool-choice`（已实现）**：`/v1/responses` 请求带 tools 但未指定 `tool_choice` 时，自动改写为 `required`——grok 免费通道在 auto 模式下倾向输出文字而不是调用工具，强制后 Claude Code 等客户端才能收到真正的 function_call。
+- **`--filter-empty-edit`（已实现）**：流式响应中检测到 `Edit` 工具调用且 `old_string == new_string`（免费通道的劣化行为，会导致 Claude Code Error editing file 死循环）时，自动替换为无害的 Bash `echo` no-op 调用，Claude 继续后续任务而不会卡住。
+- **`--control-port 40201`（已实现）**：管理接口。`GET /status` 返回全池健康快照（tokens_total/healthy/expired/cooling + 每 token 计数 + 请求统计）；`POST /refresh` 强制刷新全部过期 token。Web 平台顶栏网关控件 GET /api/gateway/status 即聚合此接口。
 - token 冷却结束后自动回到轮换池。
 
 #### 6.3.2 在 cc-switch 中添加 Grok provider（Claude Code 举例）
@@ -374,6 +379,8 @@ api_backend = "responses"
 | **流式请求 upstream 200 但 Claude Code 一直 "Waiting for API response" / "Stream error: error decoding response body"**（已实测修复） | 旧版网关把上游 SSE 原样转发却**没有声明响应边界**（无 Content-Length / 无 chunked / 未置 `Connection: close`），大请求或第二次请求时客户端读不到流结尾。**升级 grok_gateway.py 到含 `Connection: close` + 上游 EOF 后关闭的版本**（commit 之后版本），SSE 结束后客户端立即收到完整流 |
 | **上游返回 Cloudflare 400 Bad Request HTML**（已实测修复） | 客户端（cc-switch）注入的小写 `authorization` 头 + 网关注入的大写 `Authorization` 头**重复**导致 CF 拒绝。**升级网关**：转发时剔除大小写所有 `authorization`/`user-agent`/版本头，统一由网关注入 |
 | **401 "Invalid or expired credentials (... no auth context)"**（已实测修复） | 走 cc-switch 时其 API Key 被透传为 Bearer；旧版网关会再叠一层导致冲突。升级网关后客户端 key 填任意占位即可，网关负责注入真实 token |
+| **502 "Upstream returned invalid JSON. Status: 200"（经 paritok 时，已实测修复）** | 上游（grok）对带 `Accept-Encoding: gzip` 的请求返回 gzip 压缩体，网关转发时删了 `content-encoding` 头但 body 未解压 → paritok 拿 gzip 当 JSON 解析失败。**升级网关**：读全 body 后发现 gzip 魔数自动 `gzip.decompress` 再转发（解压后去掉压缩头） |
+| **429 + "subscription:free-usage-exhausted"（60+ 万 tokens / 500000 per 24h）** | 免费额度墙：每账号每天 50 万 tokens（滚动 24h 窗口），claude 大请求单次约 10 万 input tokens。24h 后自动回血；规模化=多账号轮换 + paritok 压缩（见第 9 章） |
 
 **cc-switch 侧注意（实测要点）**：
 

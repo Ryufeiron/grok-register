@@ -23,22 +23,140 @@ Grok Head-Injection Gateway (multi-token)
   python tools/grok_gateway.py --token-dir data/cpa_auth --port 40200
 """
 import argparse
+import base64
 import http.client
 import json
 import os
+import re
 import ssl
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 DEFAULT_UPSTREAM = "https://cli-chat-proxy.grok.com/v1"
 GROK_VERSION = "0.1.202"
+CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+REFRESH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 
-_token_pool = []          # [(token, last_ban_ts, ban_seconds), ...]
+_token_pool = []          # [(token, label, ban_until, refresh_token)]
 _pool_lock = threading.Lock()
 _pool_next = 0
+_sticky_idx = -1          # Sticky: 当前粘性 token 的池索引（缓存连续性）
+_quota_est = {}           # label -> {remaining, actual, limit, updated_at}
+QUOTA_LIMIT = 500000
+QUOTA_EXHAUSTED_THRESHOLD = 0
+PROBE_MIN_INTERVAL = 1800  # 自愈探测最小间隔（秒），防止风暴反复锁死
+QUOTA_STATE_FILE = None   # 额度状态持久化文件（main 设置，如 data/quota_state.json）
+_REQ_TOOLS = {"names": [], "bash_name": None}   # 最近一次请求的工具名（多线程由 GIL 保护，可接受）
+EMPTY_EDIT_LOOP_LIMIT = 3                        # 连续空 Edit 次数阈值，超过后解除 FORCED 破环
+_empty_edit_streak = 0                           # 当前连续空 Edit 计数
+
+# 运行统计（供控制台 /status 使用）
+_stats = {
+    "started_at": None,
+    "requests_total": 0,
+    "requests_429": 0,
+    "requests_exhausted": 0,
+    "token_exhausted_count": {},  # label -> count（额度耗尽）
+    "requests_401": 0,
+    "requests_ok": 0,
+    "refresh_count": 0,
+    "refresh_failed": 0,
+    "empty_edit_filtered": 0,
+    "token_last_used": {},   # label -> ts
+    "token_429_count": {},   # label -> count
+    "token_401_count": {},   # label -> count
+    "token_ok_count": {},    # label -> count
+}
+_stats_lock = threading.Lock()
+
+
+def stats_record(label, kind):
+    """kind: ok / 429 / 401 / refresh / refresh_fail / empty_edit"""
+    with _stats_lock:
+        s = _stats
+        if kind == "ok":
+            s["requests_ok"] += 1
+            s["requests_total"] += 1
+            s["token_ok_count"][label] = s["token_ok_count"].get(label, 0) + 1
+        elif kind == "429":
+            s["requests_429"] += 1
+            s["requests_total"] += 1
+            s["token_429_count"][label] = s["token_429_count"].get(label, 0) + 1
+        elif kind == "exhausted":
+            s["requests_exhausted"] += 1
+            s["requests_total"] += 1
+            s["token_exhausted_count"][label] = s["token_exhausted_count"].get(label, 0) + 1
+        elif kind == "401":
+            s["requests_401"] += 1
+            s["requests_total"] += 1
+            s["token_401_count"][label] = s["token_401_count"].get(label, 0) + 1
+        elif kind == "refresh":
+            s["refresh_count"] += 1
+        elif kind == "refresh_fail":
+            s["refresh_failed"] += 1
+        elif kind == "empty_edit":
+            s["empty_edit_filtered"] += 1
+        if label:
+            s["token_last_used"][label] = time.time()
+
+
+def snapshot_status():
+    """返回完整状态 JSON（供控制端口 /status 与日志）。"""
+    now = time.time()
+    with _pool_lock:
+        pool = list(_token_pool)
+    with _stats_lock:
+        stats = dict(_stats)
+        last_used = dict(stats.pop("token_last_used", {}))
+        c429 = dict(stats.pop("token_429_count", {}))
+        c401 = dict(stats.pop("token_401_count", {}))
+        cok = dict(stats.pop("token_ok_count", {}))
+        cex = dict(stats.pop("token_exhausted_count", {}))
+    tokens = []
+    for t, label, ban_until, rt in pool:
+        exp = _jwt_exp(t)
+        expired = bool(exp and now >= exp)
+        cooling = now < ban_until
+        tokens.append({
+            "label": label,
+            "has_refresh": bool(rt),
+            "expired": expired,
+            "exp_ts": exp,
+            "cooling": cooling,
+            "cooldown_until": int(ban_until) if cooling else None,
+            "last_used_ts": last_used.get(label),
+            "count_429": c429.get(label, 0),
+            "count_401": c401.get(label, 0),
+            "count_ok": cok.get(label, 0),
+            "count_exhausted": cex.get(label, 0),
+            "quota_remaining": _quota_get(label),
+            "quota_actual": (_quota_est.get(label) or {}).get("actual"),
+            "quota_limit": (_quota_est.get(label) or {}).get("limit", QUOTA_LIMIT),
+            "quota_updated_at": (_quota_est.get(label) or {}).get("updated_at"),
+            "sticky": label == (_token_pool[_sticky_idx][1] if 0 <= _sticky_idx < len(_token_pool) else None),
+        })
+    total_quota = sum(_quota_get(t[1]) for t in pool)
+    return {
+        "ok": True,
+        "running": True,
+        "started_at": stats["started_at"],
+        "upstream": Handler.upstream if hasattr(Handler, "upstream") else DEFAULT_UPSTREAM,
+        "port": Handler.port if hasattr(Handler, "port") else None,
+        "tokens_total": len(tokens),
+        "tokens_expired": sum(1 for t in tokens if t["expired"]),
+        "tokens_cooling": sum(1 for t in tokens if t["cooling"]),
+        "tokens_healthy": sum(1 for t in tokens if not t["expired"] and not t["cooling"]),
+        "tokens_quota_total": total_quota,
+        "empty_edit_streak": _empty_edit_streak,
+        "empty_edit_loop_limit": EMPTY_EDIT_LOOP_LIMIT,
+        "stats": stats,
+        "tokens": tokens,
+    }
 
 
 def load_token(arg):
@@ -68,44 +186,410 @@ def collect_tokens(token_dir):
                     data = json.load(f)
                 t = data.get("access_token")
                 lb = data.get("email", name)
+                rt = data.get("refresh_token") or ""
             else:
                 with open(p, encoding="utf-8") as f:
                     t = f.read().strip()
                 lb = name
+                rt = ""
             if t and t.startswith("ey"):
-                found.append((t, lb))
+                found.append((t, lb, rt, p))
         except Exception:
             continue
     return found
 
 
+def refresh_token_oauth(refresh_token):
+    """用 refresh_token 换新 access_token，成功返回新 token 字符串，失败返回 None。"""
+    try:
+        params = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "refresh_token": refresh_token,
+            "scope": REFRESH_SCOPE,
+        })
+        parsed = urlsplit(TOKEN_ENDPOINT)
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(parsed.hostname, 443, context=ctx, timeout=30)
+        conn.request("POST", parsed.path, body=params, headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": f"grok-pager/{GROK_VERSION}",
+        })
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        conn.close()
+        if resp.status == 200:
+            return json.loads(body).get("access_token")
+        return None
+    except Exception:
+        return None
+
+
+def _token_is_expired(token, now=None):
+    exp = _jwt_exp(token)
+    if exp is None:
+        return False
+    return (now or time.time()) >= exp
+
+
+def _jwt_exp(token):
+    """解析 JWT exp（UTC 秒）。解析失败返回 None（不拦截）。"""
+    try:
+        part = token.split('.')[1]
+        part += '=' * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part))
+        return payload.get('exp')
+    except Exception:
+        return None
+
+
 def pick_token():
-    """选一个未冷却的 token（round-robin），返回 (token, label) 或 None。"""
-    global _pool_next
+    """Sticky + quota-aware selection:
+    1) sticky 优先：上次用的 token 若仍健康（未冷却/未过期/额度>0）直接复用（缓存连续性最大化）
+    2) 否则选剩余额度最高且健康的 token 作为新 sticky
+    """
+    global _pool_next, _sticky_idx
     now = time.time()
     with _pool_lock:
         n = len(_token_pool)
         if n == 0:
             return None
-        for _ in range(n):
-            t, label, ban_until = _token_pool[_pool_next % n]
-            _pool_next = (_pool_next + 1) % n
-            if now >= ban_until:
+        if 0 <= _sticky_idx < n:
+            idx = _sticky_idx
+            t, label, ban_until, rt = _token_pool[idx]
+            if now >= ban_until and not _token_is_expired(t, now)                     and _quota_get(label) > QUOTA_EXHAUSTED_THRESHOLD:
                 return (t, label)
-        return (_token_pool[_pool_next % n][0], _token_pool[_pool_next % n][1])
+        best_idx = -1
+        best_score = -1e18
+        self_heal_done_this_pass = False
+        self_heal_candidate = None
+        for i in range(n):
+            t, label, ban_until, rt = _token_pool[i]
+            if now < ban_until:
+                continue
+            if _token_is_expired(t, now):
+                if not rt:
+                    continue
+                _pool_lock.release()
+                new_t = refresh_token_oauth(rt)
+                _pool_lock.acquire()
+                if new_t:
+                    _token_pool[i] = (new_t, label, 0.0, rt)
+                    _persist_token(label, new_t)
+                    stats_record(label, "refresh")
+                    print(f"[gateway] token {label} EXPIRED, refreshed OK", flush=True)
+                    t = new_t
+                else:
+                    stats_record(label, "refresh_fail")
+                    print(f"[gateway] token {label} refresh FAILED, skipping", flush=True)
+                    continue
+            entry_q = _quota_est.get(label) or {}
+            last_probe = entry_q.get("last_probe", 0) if isinstance(entry_q, dict) else 0
+            if _quota_get(label) <= QUOTA_EXHAUSTED_THRESHOLD:
+                # 额度耗尽候选：不参与正常竞争，只作为"全池无可用"时的兜底（30min 节流）
+                if not self_heal_done_this_pass and now - last_probe >= PROBE_MIN_INTERVAL:
+                    self_heal_candidate = i
+                continue
+            score = _quota_get(label) + (_pool_next * 1e-6)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        if best_idx < 0:
+            # 全池无可用 token：兜底重置一个过期探测 token（每请求最多 1 个，30min/个）
+            if self_heal_done_this_pass and self_heal_candidate is not None:
+                i = self_heal_candidate
+                label = _token_pool[i][1]
+                _quota_update(label, QUOTA_LIMIT)
+                if isinstance(_quota_est.get(label), dict):
+                    _quota_est[label]["last_probe"] = time.time()
+                else:
+                    _quota_est[label] = {"remaining": QUOTA_LIMIT, "last_probe": time.time()}
+                _quota_save()
+                print(f"[gateway] token {label} quota=0 but cooldown over, retry once (fallback)", flush=True)
+                _sticky_idx = i
+                return (_token_pool[i][0], label)
+            return None
+        _sticky_idx = best_idx
+        _pool_next = (_pool_next + 1) % n
+        return (_token_pool[best_idx][0], _token_pool[best_idx][1])
+
+
+def _quota_get(label):
+    entry = _quota_est.get(label)
+    if isinstance(entry, dict):
+        return entry.get("remaining", QUOTA_LIMIT)
+    return QUOTA_LIMIT
+
+
+def _quota_save():
+    try:
+        if not QUOTA_STATE_FILE:
+            return
+        tmp = QUOTA_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_quota_est, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, QUOTA_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _quota_load():
+    global QUOTA_STATE_FILE
+    try:
+        if QUOTA_STATE_FILE and os.path.exists(QUOTA_STATE_FILE):
+            with open(QUOTA_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            for label, v in (data or {}).items():
+                if isinstance(v, dict):
+                    _quota_est[label] = v
+                elif isinstance(v, (int, float)):
+                    _quota_est[label] = {"remaining": v, "actual": None, "limit": QUOTA_LIMIT, "updated_at": None}
+    except Exception:
+        pass
+
+
+def _quota_update(label, used_tokens):
+    entry = _quota_est.get(label)
+    if not isinstance(entry, dict):
+        entry = _quota_est[label] = {"remaining": QUOTA_LIMIT, "actual": None, "limit": QUOTA_LIMIT, "updated_at": None}
+    entry["remaining"] = max(0, entry.get("remaining", QUOTA_LIMIT) - used_tokens)
+    entry["updated_at"] = time.time()
+    _quota_save()
+
+
+def _quota_calibrate(label, actual, limit):
+    entry = _quota_est.setdefault(label, {})
+    entry["actual"] = actual
+    entry["limit"] = limit
+    entry["remaining"] = max(0, limit - actual)
+    entry["updated_at"] = time.time()
+    _quota_save()
+
+
+def _quota_consume_from_usage(label, json_body):
+    """200 响应 usage 学习：cached_tokens 不计消耗（缓存几乎免费）。"""
+    try:
+        usage = json_body.get("usage") or {}
+        prompt = usage.get("prompt_tokens", 0)
+        output = usage.get("output_tokens", 0)
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens", 0)
+        charged = max(0, prompt - cached) + output
+        if charged > 0:
+            _quota_update(label, charged)
+        return True
+    except Exception:
+        return False
 
 
 def ban_token(token, seconds):
+    global _sticky_idx
     with _pool_lock:
-        for i, (t, label, _) in enumerate(_token_pool):
+        for i, (t, label, _, rt) in enumerate(_token_pool):
             if t == token:
-                _token_pool[i] = (t, label, time.time() + seconds)
+                _token_pool[i] = (t, label, time.time() + seconds, rt)
+                if i == _sticky_idx:
+                    _sticky_idx = -1
                 print(f"[gateway] token {label} cooled down for {seconds}s", flush=True)
                 return
 
 
+def _persist_token(label, new_token):
+    """把 refresh 后的新 access_token 写回原 JSON 文件（仅当唯一匹配）。"""
+    try:
+        entries = [e for e in _token_pool if e[1] == label]
+        if len(entries) != 1:
+            return
+        rt = entries[0][3]
+        for name in os.listdir(Handler.token_dir):
+            p = os.path.join(Handler.token_dir, name)
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("email") == label and data.get("refresh_token") == rt:
+                    data["access_token"] = new_token
+                    data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    print(f"[gateway] persisted refreshed token to {name}", flush=True)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _split_sse(raw):
+    """把 SSE 字节流切分为 [(event_name, data_dict_or_None, raw_block), ...]。"""
+    blocks = raw.split(b"\n\n")
+    out = []
+    for b in blocks:
+        b = b.strip(b"\r\n")
+        if not b:
+            continue
+        lines = b.split(b"\n")
+        ev = None
+        data = None
+        for ln in lines:
+            if ln.startswith(b"event: "):
+                ev = ln[7:].decode("utf-8", "replace").strip()
+            elif ln.startswith(b"data: "):
+                dd = ln[6:].strip()
+                try:
+                    data = json.loads(dd.decode("utf-8", "replace"))
+                except Exception:
+                    data = None
+        out.append((ev, data, b + b"\n\n"))
+    return out
+
+
+def _emit_sse_event(name, data, seq, evid):
+    lines = [f"event: {name}", f"data: {json.dumps(data, ensure_ascii=False)}"]
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+def _filter_empty_edit_events(events):
+    """检测 responses SSE 流中的 Edit 工具调用 old_string==new_string，替换为文本输出。
+    返回 (new_events, replaced_with_text_or_None)。"""
+    # 找出需要删除的事件区间与消息输出
+    idx = 0
+    n = len(events)
+    text = None
+    while idx < n:
+        name, data, _ = events[idx]
+        item = None
+        if name == "response.output_item.added" and isinstance(data, dict):
+            item = data.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "function_call" and item.get("name") == "Edit":
+            # 收集这个工具调用的所有 fragment
+            args_frag = []
+            end_idx = idx
+            item_id = item.get("id", "")
+            out_idx = data.get("output_index", 0)
+            j = idx + 1
+            done_args = None
+            while j < n:
+                ename, edata, _ = events[j]
+                if ename == "response.function_call_arguments.delta" and isinstance(edata, dict):
+                    args_frag.append((edata.get("delta") or ""))
+                    j += 1
+                    end_idx = j
+                    continue
+                if ename == "response.function_call_arguments.done" and isinstance(edata, dict):
+                    done_args = edata.get("arguments")
+                    end_idx = j
+                    j += 1
+                    continue
+                if ename == "response.output_item.done" and isinstance(edata, dict):
+                    dit = edata.get("item") or {}
+                    if dit.get("arguments"):
+                        done_args = dit.get("arguments")
+                    end_idx = j
+                    break
+                end_idx = j
+                j += 1
+            if done_args:
+                exp = done_args.strip()
+            else:
+                exp = "".join(args_frag).strip()
+            old = new = None
+            try:
+                obj = json.loads(exp)
+                old = obj.get("old_string")
+                new = obj.get("new_string")
+            except Exception:
+                pass
+            if old is not None and new is not None and old == new:
+                # 替代方案：把空 Edit 改写成无害 Bash 工具调用（echo），
+                # 让 Claude Code 拿到 tool_result 后自动继续后续任务，而不是以文本结束回合。
+                log_skip = (f"empty-edit skipped: {str(obj.get('file_path', ''))[:120]}")
+                text = log_skip
+                new_args_obj = {
+                    "command": (f"echo '[gateway] empty edit skipped: old_string == new_string "
+                                f"for file: {str(obj.get('file_path', ''))[:120]}; no change needed.'"),
+                    "description": "no-op echo for skipped empty edit",
+                }
+                new_args = json.dumps(new_args_obj)
+                fn_id = f"fn_skipped_{item_id[-8:]}" if item_id else "fn_skipped"
+                # 工具名：用请求里真正的 Bash 工具名，找不到就用 execute_bash
+                bash_name = _REQ_TOOLS.get("bash_name") or "execute_bash"
+                repl = [
+                    _emit_sse_event("response.output_item.added", {
+                        "type": "response.output_item.added", "sequence_number": idx + 1,
+                        "output_index": out_idx,
+                        "item": {"id": fn_id, "type": "function_call", "status": "in_progress",
+                                 "name": bash_name, "arguments": "", "call_id": fn_id},
+                    }, idx + 1, None),
+                    _emit_sse_event("response.function_call_arguments.delta", {
+                        "type": "response.function_call_arguments.delta", "sequence_number": idx + 2,
+                        "item_id": fn_id, "output_index": out_idx, "delta": new_args,
+                    }, idx + 2, None),
+                    _emit_sse_event("response.function_call_arguments.done", {
+                        "type": "response.function_call_arguments.done", "sequence_number": idx + 3,
+                        "item_id": fn_id, "output_index": out_idx, "arguments": new_args,
+                    }, idx + 3, None),
+                    _emit_sse_event("response.output_item.done", {
+                        "type": "response.output_item.done", "sequence_number": idx + 4,
+                        "item_id": fn_id, "output_index": out_idx,
+                        "item": {"id": fn_id, "type": "function_call", "role": "assistant",
+                                 "status": "completed", "name": bash_name,
+                                 "arguments": new_args, "call_id": fn_id},
+                    }, idx + 4, None),
+                ]
+                new_events = events[:idx] + [(None, None, rb) for rb in repl] + events[end_idx + 1:]
+                return new_events, text
+            idx = end_idx + 1
+            continue
+        idx += 1
+    return events, None
+
+
+def _filter_empty_edit_raw(raw_response):
+    """对整段 upstream responses SSE 流执行空 Edit 过滤，返回替换后的字节流。"""
+    global _empty_edit_streak
+    try:
+        if b"response.output_item.added" not in raw_response:
+            if _empty_edit_streak > 0:
+                _empty_edit_streak -= 1
+            return raw_response
+        events = _split_sse(raw_response)
+        events, text = _filter_empty_edit_events(events)
+        if text is None:
+            if _empty_edit_streak > 0:
+                _empty_edit_streak -= 1
+            return raw_response
+        _empty_edit_streak += 1
+        print(f"[gateway] EMPTY EDIT detected & replaced with no-op bash ({len(text)} chars) "
+              f"(streak={_empty_edit_streak})", flush=True)
+        if _empty_edit_streak >= EMPTY_EDIT_LOOP_LIMIT:
+            print(f"[gateway] empty edit streak >= {EMPTY_EDIT_LOOP_LIMIT}, "
+                  f"disabling FORCED tool_choice to break the loop", flush=True)
+        stats_record("", "empty_edit")
+        seen_completed = False
+        out = []
+        for _, _, rb in events:
+            if rb and b"response.completed" in rb:
+                if seen_completed:
+                    continue
+                seen_completed = True
+            if rb:
+                out.append(rb)
+        return b"".join(out)
+    except Exception as e:
+        print(f"[gateway] empty-edit filter error: {e!r}", flush=True)
+        return raw_response
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    upstream = DEFAULT_UPSTREAM
+    ban_seconds = 300
+    token_dir = ""
+    force_tool_choice = False
+    force_non_stream = False
+    filter_empty_edit = False
 
     def log_message(self, fmt, *args):
         print(f"[gateway] {self.command} {self.path} <- {self.headers.get('User-Agent','')[:60]}", flush=True)
@@ -161,20 +645,61 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 bj = json.loads(body)
                 print(f"[gateway] fwd-model={bj.get('model')} stream={bj.get('stream')} keys={list(bj.keys())[:12]} tools={len(bj.get('tools') or [])}", flush=True)
+                tools_list = bj.get("tools") or []
+                latest_tools = []
+                for tl_ in tools_list:
+                    tname = tl_.get("name") if isinstance(tl_, dict) else None
+                    if tname:
+                        latest_tools.append(tname)
+                # 优先 Bash 类工具（Claude Code 用 execute_bash / ExecuteBash / Bash / bash）
+                bs_name = None
+                for cand in ("execute_bash", "ExecuteBash", "Bash", "bash"):
+                    if cand in latest_tools:
+                        bs_name = cand
+                        break
+                _REQ_TOOLS["names"] = latest_tools
+                _REQ_TOOLS["bash_name"] = bs_name
+                if Handler.force_non_stream and bj.get("stream"):
+                    bj["stream"] = False
+                    body = json.dumps(bj).encode()
+                    print("[gateway] FORCED non-stream", flush=True)
+                if tools_list and Handler.force_tool_choice and _empty_edit_streak < EMPTY_EDIT_LOOP_LIMIT:
+                    tc = bj.get("tool_choice")
+                    cur = tc.get("type") if isinstance(tc, dict) else str(tc)
+                    if cur != "required":
+                        old = json.dumps(tc)[:80] if tc is not None else "none"
+                        bj["tool_choice"] = "required"
+                        body = json.dumps(bj).encode()
+                        print(f"[gateway] FORCED tool_choice: {old} -> required", flush=True)
+                hdrs["Content-Length"] = str(len(body))
             except Exception as e:
                 print(f"[gateway] body not json: {e!r}", flush=True)
 
         used_tokens = set()
         status = None
+        retry_after = None
+        max_cooldown = 0
+        exhausted_all = False
         while True:
             picked = pick_token()
             if picked is None:
-                self._reply(502, {"error": {"message": "no token available"}})
+                if exhausted_all or max_cooldown > 0:
+                    self._reply(429, {
+                        "code": "subscription:free-usage-exhausted",
+                        "error": {
+                            "message": "所有 token 免费额度已耗尽（free-usage-exhausted），已冷却，Retry-After 后重试",
+                            "retry_after": max_cooldown,
+                        },
+                    })
+                elif retry_after:
+                    self._reply_429(retry_after)
+                else:
+                    self._reply(429, {"error": {"message": "all tokens throttled or expired"}})
                 conn.close()
                 return
             token, label = picked
-            if token in used_tokens and len(used_tokens) == len(_token_pool):
-                break
+            if token in used_tokens:
+                continue
             used_tokens.add(token)
             hdrs_ = dict(hdrs)
             hdrs_["Authorization"] = "Bearer " + token
@@ -183,35 +708,151 @@ class Handler(BaseHTTPRequestHandler):
                 resp = conn.getresponse()
                 status = resp.status
                 if status in (429,):
-                    ban_token(token, Handler.ban_seconds)
-                    self._drain(resp)
+                    body_429 = b""
+                    try:
+                        while len(body_429) < 65536:
+                            body_chunk = resp.read(65536)
+                            if not body_chunk:
+                                break
+                            body_429 += body_chunk
+                    except Exception:
+                        pass
+                    is_exhausted = b"free-usage-exhausted" in body_429 or b"free_usage_exhausted" in body_429
+                    if is_exhausted:
+                        ban_secs = Handler.exhaust_ban_hours * 3600
+                        print(f"[gateway] token {label} 免费额度耗尽 (free-usage-exhausted)，冷却 {Handler.exhaust_ban_hours}h 并切换下一 token", flush=True)
+                        stats_record(label, "exhausted")
+                        _quota_update(label, QUOTA_LIMIT * 2)   # 打到 0：估算额度清零
+                        try:
+                            text = body_429.decode("utf-8", "replace")
+                            actual = limit = None
+                            try:
+                                err = json.loads(text) or {}
+                                usage = ((err.get("error") or {}).get("usage") or {}) if isinstance((err.get("error") or {}), dict) else {}
+                                actual, limit = usage.get("actual"), usage.get("limit")
+                            except Exception:
+                                pass
+                            if not isinstance(actual, (int, float)) or not isinstance(limit, (int, float)):
+                                m = re.search(r"\(actual/limit\):\s*(\d+)\s*/\s*(\d+)", text)
+                                if m:
+                                    actual, limit = int(m.group(1)), int(m.group(2))
+                            if isinstance(actual, (int, float)) and isinstance(limit, (int, float)):
+                                _quota_calibrate(label, actual, limit)
+                                print(f"[gateway] quota calibrated: {label} actual={actual} limit={limit}", flush=True)
+                        except Exception:
+                            pass
+                        ban_token(token, ban_secs)
+                        max_cooldown = max(max_cooldown, ban_secs)
+                        exhausted_all = True
+                        # 终结 retry：全池都耗尽时继续试其他 token 只会连环撞墙，直接快速返回 429
+                        self._reply(429, {
+                            "code": "subscription:free-usage-exhausted",
+                            "error": {
+                                "message": "所有 token 免费额度已耗尽（free-usage-exhausted），已冷却，Retry-After 后重试",
+                                "retry_after": max_cooldown,
+                            },
+                        })
+                        conn.close()
+                        return
+                    else:
+                        ra = resp.getheader("Retry-After")
+                        try:
+                            ra = int(ra) if ra else None
+                        except Exception:
+                            ra = None
+                        if ra and (retry_after is None or ra > retry_after):
+                            retry_after = ra
+                        ban_token(token, min(Handler.ban_seconds, ra or Handler.ban_seconds))
+                        stats_record(label, "429")
                     continue
                 if status in (401, 403):
+                    exp = _jwt_exp(token)
+                    rt_entry = None
+                    with _pool_lock:
+                        for i, (t, _l, _b, rtk) in enumerate(_token_pool):
+                            if t == token:
+                                rt_entry = (i, rtk)
+                                break
+                    if rt_entry and rt_entry[1] and (exp is None or exp < time.time()):
+                        print(f"[gateway] token {label} 401 but refresh_token present, refreshing", flush=True)
+                        new_t = refresh_token_oauth(rt_entry[1])
+                        if new_t:
+                            with _pool_lock:
+                                _token_pool[rt_entry[0]] = (new_t, label, 0.0, rt_entry[1])
+                                _persist_token(label, new_t)
+                                stats_record(label, "refresh")
+                                resp.read()
+                                continue
+                        print(f"[gateway] token {label} refresh during 401 FAILED, removing", flush=True)
+                        with _pool_lock:
+                            _token_pool[:] = [(t, lb, bt, rt2) for t, lb, bt, rt2 in _token_pool if t != token]
+                    elif exp is not None:
+                        print(f"[gateway] token {label} rejected (exp={exp}), removing from pool", flush=True)
+                        with _pool_lock:
+                            _token_pool[:] = [(t, lb, bt, rt2) for t, lb, bt, rt2 in _token_pool if t != token]
+                    else:
+                        with _pool_lock:
+                            _token_pool[:] = [(t, lb, bt, rt2) for t, lb, bt, rt2 in _token_pool if t != token]
+                        print(f"[gateway] token {label} 401 without refresh_token, removing from pool", flush=True)
+                    stats_record(label, "401")
                     resp.read()
-                    ban_token(token, Handler.ban_seconds)
                     continue
-                self.send_response(status)
-                del_h = ("content-length", "connection", "transfer-encoding", "content-encoding")
-                for k, v in resp.getheaders():
-                    if k.lower() not in del_h:
-                        self.send_header(k, v)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.close_connection = True
                 t_start = time.time()
                 print(f"[gateway] -> upstream status {status} for {self.command} {self.path} token {label}", flush=True)
+                stats_record(label, "ok")
                 resp_body = b""
-                chunk = resp.read1(65536)
+                upstream_ce = ""
+                for k, v in resp.getheaders():
+                    if k.lower() == "content-encoding":
+                        upstream_ce = v
+                try:
+                    self.send_response(status)
+                    del_h = ("content-length", "connection", "transfer-encoding")
+                    for k, v in resp.getheaders():
+                        if k.lower() not in del_h and k.lower() != "content-encoding":
+                            self.send_header(k, v)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                except Exception as e:
+                    print(f"[gateway] response header write failed: {e!r}", flush=True)
+                    conn.close()
+                    return
+                stream_gz = None
+                if upstream_ce and upstream_ce.lower() == "gzip":
+                    import gzip as _gz
+                    stream_gz = _gz.GzipFile(fileobj=resp)
+                chunk = (stream_gz.read1(65536) if stream_gz else resp.read1(65536)) or b""
                 while chunk:
                     resp_body += chunk
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
                     if b'[DONE]' in chunk:
                         print(f"[gateway] SSE [DONE] seen after {time.time()-t_start:.1f}s", flush=True)
                     if b'response.completed' in chunk:
                         print(f"[gateway] response.completed seen at {time.time()-t_start:.1f}s", flush=True)
-                    chunk = resp.read1(65536)
+                    try:
+                        self.wfile.write(b"%x\r\n" % len(chunk))
+                        self.wfile.write(chunk)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                    except Exception as e:
+                        print(f"[gateway] stream write aborted after {time.time()-t_start:.1f}s: {e!r}", flush=True)
+                        break
+                    chunk = (stream_gz.read1(65536) if stream_gz else resp.read1(65536)) or b""
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
                 print(f"[gateway] upstream body EOF after {time.time()-t_start:.1f}s total, resp_rcvd={len(resp_body)}", flush=True)
+                try:
+                    if resp_body[:1] == b"{":
+                        try:
+                            _quota_consume_from_usage(label, json.loads(resp_body.decode("utf-8", "replace")))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 try:
                     with open(r'C:\Users\fr_li\AppData\Local\Temp\opencode\gw_last_body.bin', 'wb') as fb:
                         fb.write(resp_body)
@@ -227,8 +868,18 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 conn.close()
                 return
-        self._reply(status or 502, {"error": {"message": "all tokens throttled or invalid"}})
+        self._reply(429, {"error": {"message": "all tokens throttled or expired"}})
         conn.close()
+
+    def _reply_429(self, retry_after):
+        try:
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", str(retry_after))
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": {"message": "rate limited, retry after", "retry_after": retry_after}}).encode())
+        except Exception:
+            pass
 
     def _drain(self, resp):
         try:
@@ -254,6 +905,57 @@ class Handler(BaseHTTPRequestHandler):
     do_OPTIONS = lambda self: self._proxy("OPTIONS")
 
 
+class ControlHandler(BaseHTTPRequestHandler):
+    """控制端口：GET /status（池健康度快照）、POST /refresh（强制 refresh 全部过期 token）。"""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/status":
+            self._json(200, snapshot_status())
+        else:
+            self._json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        if self.path == "/refresh":
+            with _pool_lock:
+                pairs = [(idx, t, label, rt) for idx, (t, label, _, rt) in enumerate(_token_pool)]
+            refreshed = 0
+            removed = 0
+            for idx, t, label, rt in pairs:
+                if not rt:
+                    continue
+                if not _token_is_expired(t):
+                    continue
+                new_t = refresh_token_oauth(rt)
+                if new_t:
+                    with _pool_lock:
+                        _token_pool[idx] = (new_t, label, 0.0, rt)
+                    _persist_token(label, new_t)
+                    stats_record(label, "refresh")
+                    refreshed += 1
+                    print(f"[gateway] control refresh OK: {label}", flush=True)
+                else:
+                    with _pool_lock:
+                        _token_pool[:] = [(t2, lb2, bt2, rt2) for t2, lb2, bt2, rt2 in _token_pool if t2 != t]
+                    stats_record(label, "refresh_fail")
+                    removed += 1
+                    print(f"[gateway] control refresh FAILED (removed): {label}", flush=True)
+            self._json(200, {"ok": True, "refreshed": refreshed, "removed": removed})
+        else:
+            self._json(404, {"ok": False, "error": "not found"})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--token", default=None)
@@ -263,12 +965,22 @@ def main():
     ap.add_argument("--port", type=int, default=40200)
     ap.add_argument("--upstream", default=DEFAULT_UPSTREAM)
     ap.add_argument("--ban-seconds", type=int, default=300, help="429/401 后该 token 冷却秒数（默认 300）")
+    ap.add_argument("--exhaust-ban-hours", type=float, default=24.0, help="免费额度耗尽(free-usage-exhausted)后冷却小时数（默认 24）")
+    ap.add_argument("--force-tool-choice", action="store_true",
+                    help="带 tools 的 responses 请求强制 tool_choice=required（修复 grok free 不真调工具只输出文字）")
+    ap.add_argument("--filter-empty-edit", action="store_true",
+                    help="过滤响应中的 old_string==new_string 的空 Edit 工具调用，替换为提示文本（防 Claude Code 编辑死循环）")
+    ap.add_argument("--force-non-stream", action="store_true",
+                    help="把 responses 请求的 stream 强制改为 False（上游返回完整 JSON 而非 SSE，规避 cc-switch 流式解码失败）")
+    ap.add_argument("--control-port", type=int, default=0,
+                    help="控制端口（默认 0=关闭；设如 40201 可访问 /status、POST /refresh）")
+    ap.add_argument("--quota-state-file", default=None,
+                    help="额度状态持久化文件（默认 <token_dir父目录>/quota_state.json；重启后恢复剩余额度估算，避免把已耗尽 token 当满额）")
     args = ap.parse_args()
 
     entries = []
     if args.token_dir and os.path.isdir(args.token_dir):
-        for t, lb in collect_tokens(args.token_dir):
-            entries.append((t, lb))
+        entries.extend(collect_tokens(args.token_dir))
         print(f"[gateway] loaded {len(entries)} token(s) from {args.token_dir}", flush=True)
     if not entries:
         src = args.token or (open(args.token_file, encoding="utf-8").read() if args.token_file else None)
@@ -277,18 +989,39 @@ def main():
         if not src:
             print("no token source given (use --token/--token-file/--token-dir)", file=sys.stderr)
             sys.exit(2)
-        entries.append((load_token(src), "single"))
+        entries.append((load_token(src), "single", "", ""))
 
     now = time.time()
     with _pool_lock:
         _token_pool.clear()
-        _token_pool.extend((t, lb, 0.0) for t, lb in entries)
+        _token_pool.extend((t, lb, 0.0, rt) for t, lb, rt, _p in entries)
 
     Handler.upstream = args.upstream.rstrip("/")
     Handler.ban_seconds = args.ban_seconds
+    Handler.token_dir = args.token_dir or ""
+    global QUOTA_STATE_FILE
+    if args.quota_state_file:
+        QUOTA_STATE_FILE = args.quota_state_file
+    elif args.token_dir:
+        QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(args.token_dir)), "quota_state.json")
+    _quota_load()
+    if QUOTA_STATE_FILE:
+        print(f"[gateway] quota state file: {QUOTA_STATE_FILE} ({len(_quota_est)} entries loaded)", flush=True)
+    Handler.force_tool_choice = args.force_tool_choice
+    Handler.force_non_stream = args.force_non_stream
+    Handler.filter_empty_edit = args.filter_empty_edit
+    Handler.exhaust_ban_hours = args.exhaust_ban_hours
+    Handler.port = args.port
+    with _stats_lock:
+        _stats["started_at"] = time.time()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    if args.control_port:
+        from threading import Thread
+        ctl = ThreadingHTTPServer(("127.0.0.1", args.control_port), ControlHandler)
+        Thread(target=ctl.serve_forever, daemon=True).start()
+        print(f"[gateway] control api on http://127.0.0.1:{args.control_port}/status", flush=True)
     print(f"grok gateway listening on http://127.0.0.1:{args.port} -> {Handler.upstream}", flush=True)
-    print(f"tokens: {[lb for _, lb in entries]}", flush=True)
+    print(f"tokens: {[lb for _, lb, _, _ in entries]}", flush=True)
     srv.serve_forever()
 
 if __name__ == '__main__':

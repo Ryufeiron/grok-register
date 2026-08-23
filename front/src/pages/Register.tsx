@@ -21,7 +21,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { api, type AccountRecord, type JobStatus, type LogItem } from "@/lib/api";
+import { api, type AccountRecord, type GatewayStatus, type GatewayTask, type JobStatus, type LogItem } from "@/lib/api";
 import {
   Badge,
   Button,
@@ -39,7 +39,8 @@ import {
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
-type BusyAction = "" | "start" | "stop" | "check" | "kill";
+type BusyAction = "" | "start" | "stop" | "check" | "kill" | "register" | "refresh";
+type RegisterMode = "local" | "actions";
 type LogTone = "default" | "success" | "error" | "warn" | "info";
 type DisplayLogItem = LogItem & { tone: LogTone; searchText: string };
 
@@ -147,6 +148,9 @@ const LogLine = memo(function LogLine({ item }: { item: DisplayLogItem }) {
 export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const [count, setCount] = useState("1");
   const [workers, setWorkers] = useState("1");
+  const [mode, setMode] = useState<RegisterMode>("local");
+  const [gwStatus, setGwStatus] = useState<GatewayStatus | null>(null);
+  const [gwTask, setGwTask] = useState<GatewayTask | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<DisplayLogItem[]>([]);
   const [renderedLogLimit, setRenderedLogLimit] = useState(DEFAULT_RENDERED_LOGS);
@@ -250,6 +254,29 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       })
       .catch(() => undefined);
   }, []);
+
+  // Actions 模式下轮询网关状态与注册任务进度
+  useEffect(() => {
+    if (view !== "new" || mode !== "actions") return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const [status, task] = await Promise.all([api.gatewayStatus(), api.gatewayRegisterStatus()]);
+        if (cancelled) return;
+        setGwStatus(status);
+        setGwTask(task.task ?? null);
+      } catch {
+        // 网关控制接口不可用（旧版后端）时静默
+      }
+    };
+    const timer = window.setInterval(tick, 4000);
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [view, mode]);
 
   useEffect(() => {
     if (!jobPolling) return;
@@ -385,6 +412,24 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     }
   };
 
+  const onGatewayRegister = async () => {
+    setBusyAction("register");
+    try {
+      const data = await api.gatewayRegister();
+      if (data.already_running) {
+        showToast("注册任务已在运行，请稍候", "default");
+      } else {
+        showToast("已触发 GitHub Actions 注册，约 15-40 分钟完成", "success");
+      }
+      const task = await api.gatewayRegisterStatus();
+      setGwTask(task.task ?? null);
+    } catch (err: any) {
+      showToast(err.message || "触发注册失败", "error");
+    } finally {
+      setBusyAction("");
+    }
+  };
+
   const onStop = async () => {
     setBusyAction("stop");
     try {
@@ -478,90 +523,266 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         />
         <Card className="overflow-hidden">
           <CardHeader className="border-b border-slate-100">
-            <CardTitle>任务设置</CardTitle>
-            <CardDescription>本次参数只影响即将启动的注册任务。</CardDescription>
+            <CardTitle>注册模式</CardTitle>
+            <CardDescription>选择注册通道：本机直接注册，或远程 GitHub Actions（美国出口，规避区域封锁）。</CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-6 p-4 sm:p-6 lg:grid-cols-[minmax(0,1fr)_300px]">
-            <div className="space-y-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="count">注册数量</Label>
-                  <Input
-                    id="count"
-                    type="number"
-                    inputMode="numeric"
-                    min={1}
-                    max={1000}
-                    value={count}
-                    disabled={!!job?.running}
-                    onChange={(event) => setCount(event.target.value)}
-                    onBlur={() => setCount(String(normalizeInteger(count, 1, 1000)))}
-                  />
-                  <p className="text-xs text-slate-500">支持 1–1000 个账号。</p>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="workers">并发浏览器</Label>
-                  <Input
-                    id="workers"
-                    type="number"
-                    inputMode="numeric"
-                    min={1}
-                    max={8}
-                    value={workers}
-                    disabled={!!job?.running}
-                    onChange={(event) => setWorkers(event.target.value)}
-                    onBlur={() => setWorkers(String(normalizeInteger(workers, 1, 8)))}
-                  />
-                  <p className="text-xs text-slate-500">建议从 1–3 个并发开始。</p>
-                </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-3">
-                {(
-                  [
-                    ["邮箱服务", "沿用系统配置"],
-                    ["网络代理", "按配置自动生效"],
-                    ["授权目标", "CPA / Grok2API"],
-                  ] as const
-                ).map(([label, value]) => (
-                  <div key={label} className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
-                    <div className="text-xs text-slate-500">{label}</div>
-                    <div className="mt-1 text-sm font-medium text-slate-900">{value}</div>
-                  </div>
-                ))}
-              </div>
-              <div className="flex flex-col gap-2 border-t border-slate-100 pt-5 sm:flex-row">
-                <Button className="sm:min-w-40" onClick={onStart} disabled={!!busyAction || !!job?.running}>
-                  {busyAction === "start" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                  开始注册
-                </Button>
-                <Button variant="outline" onClick={onCheck} disabled={!!busyAction}>
-                  {busyAction === "check" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wifi className="h-4 w-4" />}
-                  连通性检查
-                </Button>
-              </div>
-            </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:p-5">
-              <div className="text-xs font-medium text-slate-500">任务预览</div>
-              <div className="mt-2 text-xl font-semibold text-slate-950">{job?.running ? "注册进行中" : "等待启动"}</div>
-              <p className="mt-2 text-sm leading-6 text-slate-500">
-                {job?.running
-                  ? `${job.current_stage || "正在执行"}${job.current_email ? ` · ${job.current_email}` : ""}`
-                  : "启动后可在运行监控页面查看完整进度。"}
-              </p>
-              <div className="mt-5 grid grid-cols-2 gap-2 text-center">
-                <div className="rounded-xl bg-white px-2 py-3">
-                  <div className="text-lg font-semibold tabular-nums text-slate-950">{count}</div>
-                  <div className="text-[11px] text-slate-500">目标账号</div>
-                </div>
-                <div className="rounded-xl bg-white px-2 py-3">
-                  <div className="text-lg font-semibold tabular-nums text-slate-950">{workers}</div>
-                  <div className="text-[11px] text-slate-500">并发数</div>
-                </div>
-              </div>
+          <CardContent className="p-4 sm:p-6">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() => setMode("local")}
+                className={cn(
+                  "flex items-start gap-3 rounded-xl border p-4 text-left transition",
+                  mode === "local"
+                    ? "border-sky-500 bg-sky-50/60 ring-1 ring-sky-500/30"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                )}
+              >
+                <span
+                  className={cn(
+                    "mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2",
+                    mode === "local" ? "border-sky-500" : "border-slate-300"
+                  )}
+                >
+                  {mode === "local" ? <span className="h-2 w-2 rounded-full bg-sky-500" /> : null}
+                </span>
+                <span>
+                  <span className="block text-sm font-semibold text-slate-900">本地注册</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">
+                    由本机浏览器直接注册。出口 IP 需在非中国地区（美国住宅/机房代理可）。
+                  </span>
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("actions")}
+                className={cn(
+                  "flex items-start gap-3 rounded-xl border p-4 text-left transition",
+                  mode === "actions"
+                    ? "border-sky-500 bg-sky-50/60 ring-1 ring-sky-500/30"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                )}
+              >
+                <span
+                  className={cn(
+                    "mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2",
+                    mode === "actions" ? "border-sky-500" : "border-slate-300"
+                  )}
+                >
+                  {mode === "actions" ? <span className="h-2 w-2 rounded-full bg-sky-500" /> : null}
+                </span>
+                <span>
+                  <span className="block text-sm font-semibold text-slate-900">GitHub Actions 远程注册</span>
+                  <span className="mt-1 block text-xs leading-5 text-slate-500">
+                    触发 fork 仓库 Actions（美国出口）批量注册，结果自动合并进本机 Token 池并重启网关。
+                  </span>
+                </span>
+              </button>
             </div>
           </CardContent>
         </Card>
-        {checks.length ? (
+
+        {mode === "actions" ? (
+          <Card className="overflow-hidden">
+            <CardHeader className="border-b border-slate-100">
+              <CardTitle>远程注册（GitHub Actions）</CardTitle>
+              <CardDescription>注册完成后自动下载 artifact、合并 Token 并重启网关（约 15-40 分钟）。</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5 p-4 sm:p-6">
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                  <div className="text-xs text-slate-500">请求数量</div>
+                  <div className="mt-1 text-sm font-medium text-slate-900">16 / 批（workflow 固定）</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                  <div className="text-xs text-slate-500">预计成功率</div>
+                  <div className="mt-1 text-sm font-medium text-slate-900">约 40%（Turnstile 随机）</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                  <div className="text-xs text-slate-500">网关 Token 池</div>
+                  <div className="mt-1 text-sm font-medium text-slate-900">
+                    {gwStatus ? `${gwStatus.tokens_total} 个` : "—"}
+                    {gwStatus && gwStatus.tokens_healthy !== gwStatus.tokens_total
+                      ? `（健康 ${gwStatus.tokens_healthy}）`
+                      : ""}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  onClick={onGatewayRegister}
+                  disabled={!!busyAction || !!gwTask?.running}
+                >
+                  {busyAction === "register" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                  {gwTask?.running ? "注册进行中…" : "注册新 Token"}
+                </Button>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-slate-900">Token 池健康度</div>
+                  {gwStatus?.warn ? (
+                    <Badge variant="destructive">可用率低于 {Math.round((gwStatus.warn_threshold || 0.5) * 100)}%</Badge>
+                  ) : (
+                    <Badge variant="success">正常</Badge>
+                  )}
+                </div>
+                {gwStatus ? (
+                  <>
+                    <div className="mt-3 flex items-end gap-2">
+                      <span className="text-2xl font-semibold tabular-nums text-slate-950">
+                        {Math.round((gwStatus.healthy_rate || 0) * 100)}%
+                      </span>
+                      <span className="pb-1 text-xs tabular-nums text-slate-500">
+                        健康 {gwStatus.tokens_healthy} / 全部 {gwStatus.tokens_total} / 冷却 {gwStatus.tokens_cooling} /
+                        过期 {gwStatus.tokens_expired}
+                      </span>
+                    </div>
+                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                      <div
+                        className={cn(
+                          "h-full rounded-full transition-[width]",
+                          (gwStatus.healthy_rate || 0) >= 0.5 ? "bg-emerald-500" : "bg-rose-500"
+                        )}
+                        style={{ width: `${Math.round((gwStatus.healthy_rate || 0) * 100)}%` }}
+                      />
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-slate-600 sm:grid-cols-4">
+                      <div>
+                        <span className="text-slate-400">状态：</span>
+                        {gwStatus.running ? "运行中" : "未运行"}
+                      </div>
+                      <div>
+                        <span className="text-slate-400">端口：</span>
+                        {gwStatus.port ?? gwStatus.url ? "40200/40201" : "—"}
+                      </div>
+                      <div>
+                        <span className="text-slate-400">已处理：</span>
+                        {gwStatus.stats ? String((gwStatus.stats as any).requests_total ?? 0) : "—"} 次
+                      </div>
+                      <div>
+                        <span className="text-slate-400">空编辑过滤：</span>
+                        {gwStatus.stats ? String((gwStatus.stats as any).empty_edit_filtered ?? 0) : "—"} 次
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <p className="mt-2 text-xs text-slate-500">网关控制接口不可用（需要新版后端）。</p>
+                )}
+              </div>
+
+              {gwTask?.last_result ? (
+                <div className="rounded-xl border border-slate-200 p-4 text-xs leading-6">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    上次注册结果
+                    {gwTask.last_result.ok ? <Badge variant="success">成功</Badge> : <Badge variant="destructive">失败</Badge>}
+                  </div>
+                  <div className="mt-1 text-slate-500">
+                    {gwTask.last_result.started ? `开始 ${gwTask.last_result.started} · ` : ""}
+                    {gwTask.last_result.finished ? `结束 ${gwTask.last_result.finished} · ` : ""}
+                    {gwTask.last_result.duration_s != null ? `耗时 ${gwTask.last_result.duration_s}s` : ""}
+                  </div>
+                  {gwTask.last_result.error ? (
+                    <div className="mt-1 text-rose-600">{gwTask.last_result.error}</div>
+                  ) : (
+                    (gwTask.last_result.stdout_tail || []).slice(-10).map((line, idx) => (
+                      <div key={idx} className="truncate text-slate-600">
+                        {line}
+                      </div>
+                    ))
+                  )}
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+        ) : (
+          <>
+            <Card className="overflow-hidden">
+              <CardHeader className="border-b border-slate-100">
+                <CardTitle>任务设置</CardTitle>
+                <CardDescription>本次参数只影响即将启动的注册任务。</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-6 p-4 sm:p-6 lg:grid-cols-[minmax(0,1fr)_300px]">
+                <div className="space-y-5">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="count">注册数量</Label>
+                      <Input
+                        id="count"
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        max={1000}
+                        value={count}
+                        disabled={!!job?.running}
+                        onChange={(event) => setCount(event.target.value)}
+                        onBlur={() => setCount(String(normalizeInteger(count, 1, 1000)))}
+                      />
+                      <p className="text-xs text-slate-500">支持 1–1000 个账号。</p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="workers">并发浏览器</Label>
+                      <Input
+                        id="workers"
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        max={8}
+                        value={workers}
+                        disabled={!!job?.running}
+                        onChange={(event) => setWorkers(event.target.value)}
+                        onBlur={() => setWorkers(String(normalizeInteger(workers, 1, 8)))}
+                      />
+                      <p className="text-xs text-slate-500">建议从 1–3 个并发开始。</p>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    {(
+                      [
+                        ["邮箱服务", "沿用系统配置"],
+                        ["网络代理", "按配置自动生效"],
+                        ["授权目标", "CPA / Grok2API"],
+                      ] as const
+                    ).map(([label, value]) => (
+                      <div key={label} className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                        <div className="text-xs text-slate-500">{label}</div>
+                        <div className="mt-1 text-sm font-medium text-slate-900">{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex flex-col gap-2 border-t border-slate-100 pt-5 sm:flex-row">
+                    <Button className="sm:min-w-40" onClick={onStart} disabled={!!busyAction || !!job?.running}>
+                      {busyAction === "start" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                      开始注册
+                    </Button>
+                    <Button variant="outline" onClick={onCheck} disabled={!!busyAction}>
+                      {busyAction === "check" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wifi className="h-4 w-4" />}
+                      连通性检查
+                    </Button>
+                  </div>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:p-5">
+                  <div className="text-xs font-medium text-slate-500">任务预览</div>
+                  <div className="mt-2 text-xl font-semibold text-slate-950">{job?.running ? "注册进行中" : "等待启动"}</div>
+                  <p className="mt-2 text-sm leading-6 text-slate-500">
+                    {job?.running
+                      ? `${job.current_stage || "正在执行"}${job.current_email ? ` · ${job.current_email}` : ""}`
+                      : "启动后可在运行监控页面查看完整进度。"}
+                  </p>
+                  <div className="mt-5 grid grid-cols-2 gap-2 text-center">
+                    <div className="rounded-xl bg-white px-2 py-3">
+                      <div className="text-lg font-semibold tabular-nums text-slate-950">{count}</div>
+                      <div className="text-[11px] text-slate-500">目标账号</div>
+                    </div>
+                    <div className="rounded-xl bg-white px-2 py-3">
+                      <div className="text-lg font-semibold tabular-nums text-slate-950">{workers}</div>
+                      <div className="text-[11px] text-slate-500">并发数</div>
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+            {checks.length ? (
           <Card className="overflow-hidden">
             <CardHeader className="border-b border-slate-100">
               <CardTitle>连通性结果</CardTitle>
@@ -586,7 +807,9 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
             </CardContent>
           </Card>
         ) : null}
-        <Toast message={toast.message} tone={toast.tone} />
+            <Toast message={toast.message} tone={toast.tone} />
+          </>
+        )}
       </div>
     );
   }
