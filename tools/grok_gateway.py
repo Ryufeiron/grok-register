@@ -118,6 +118,10 @@ QUOTA_SAVE_INTERVAL = 30.0  # quota state disk-flush throttle (seconds)
 _REQ_TOOLS = {"names": [], "bash_name": None}   # 最近一次请求的工具名（多线程由 GIL 保护，可接受）
 EMPTY_EDIT_LOOP_LIMIT = 3                        # 连续空 Edit 次数阈值，超过后解除 FORCED 破环
 _empty_edit_streak = 0                           # 当前连续空 Edit 计数
+SMALL_TALK_RE = re.compile(
+    r'^\s*(hi|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|谢谢|多谢|感谢|thanks|thank you|thx|ty|ok|okay|好的|好|明白|了解|收到|嗯|哦|哦哦|行|可以的|辛苦了|再见|bye|good night|晚安)\s*[!！.。?？~～,，、…\-]*\s*$',
+    re.IGNORECASE,
+)
 
 # 运行统计（供控制台 /status 使用）
 _stats = {
@@ -740,26 +744,41 @@ class Handler(BaseHTTPRequestHandler):
                     conversation = bj.get("messages")
                     if conversation is None:
                         conversation = bj.get("input")
+                    last_user_text = ""
                     if isinstance(conversation, list):
                         for msg in conversation[:-1]:
                             if not isinstance(msg, dict):
                                 continue
                             if msg.get("tool_calls") or msg.get("tool_call_id"):
                                 has_tool_history = True
+                        for msg in reversed(conversation):
+                            if isinstance(msg, dict) and msg.get("role") == "user":
+                                c = msg.get("content")
+                                if isinstance(c, list):
+                                    c = " ".join(
+                                        p.get("text", "") if isinstance(p, dict) else str(p)
+                                        for p in c
+                                    )
+                                last_user_text = str(c or "")
                                 break
-                    if has_tool_history:
+                    small_talk = bool(
+                        not has_tool_history
+                        and last_user_text
+                        and SMALL_TALK_RE.match(last_user_text)
+                    )
+                    if not small_talk:
                         tc = bj.get("tool_choice")
                         cur = tc.get("type") if isinstance(tc, dict) else str(tc)
                         if cur != "required":
                             old = json.dumps(tc)[:80] if tc is not None else "none"
                             bj["tool_choice"] = "required"
                             body = json.dumps(bj).encode()
-                            print(f"[gateway] FORCED tool_choice: {old} -> required (tool history detected)", flush=True)
+                            print(f"[gateway] FORCED tool_choice: {old} -> required", flush=True)
                     else:
-                        if isinstance(bj.get("tool_choice"), dict) or str(bj.get("tool_choice")) != "none":
+                        if bj.get("tool_choice") != "auto":
                             bj["tool_choice"] = "auto"
                             body = json.dumps(bj).encode()
-                            print("[gateway] relaxed tool_choice -> auto (no tool history)", flush=True)
+                            print("[gateway] relaxed tool_choice -> auto (small talk)", flush=True)
                 hdrs["Content-Length"] = str(len(body))
             except Exception as e:
                 print(f"[gateway] body not json: {e!r}", flush=True)
