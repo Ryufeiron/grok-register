@@ -24,6 +24,7 @@ Grok Head-Injection Gateway (multi-token)
 """
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -118,8 +119,25 @@ QUOTA_SAVE_INTERVAL = 30.0  # quota state disk-flush throttle (seconds)
 _REQ_TOOLS = {"names": [], "bash_name": None}   # 最近一次请求的工具名（多线程由 GIL 保护，可接受）
 EMPTY_EDIT_LOOP_LIMIT = 3                        # 连续空 Edit 次数阈值，超过后解除 FORCED 破环
 _empty_edit_streak = 0                           # 当前连续空 Edit 计数
+GREETING_RE = re.compile(
+    r'^\s*(hi|hi there|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|再见|拜拜|bye|good night|good morning|晚安|早安)\s*[!！.。?？~～,，、…\-]*\s*$',
+    re.IGNORECASE,
+)
+# 客户端（opencode 等）会在用户消息中注入 <env>/<instructions> 等包装块，匹配问候/确认前先剥离
+CLIENT_WRAPPER_RE = re.compile(
+    r'<\s*(?:env|environment|instructions|system-reminder|context|dcp-message-id|dcp-system-reminder)(?:\s[^>]*)?>.*?<\s*/\s*(?:env|environment|instructions|system-reminder|context|dcp-message-id|dcp-system-reminder)\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_client_wrappers(text):
+    try:
+        cleaned = CLIENT_WRAPPER_RE.sub(" ", text or "")
+    except Exception:
+        return text or ""
+    return cleaned.strip()
 SMALL_TALK_RE = re.compile(
-    r'^\s*(hi|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|谢谢|多谢|感谢|thanks|thank you|thx|ty|ok|okay|好的|好|明白|了解|收到|嗯|哦|哦哦|行|可以的|辛苦了|再见|bye|good night|晚安)\s*[!！.。?？~～,，、…\-]*\s*$',
+    r'^\s*(hi|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|谢谢|多谢|感谢|thanks|thank you|thx|ty|ok|okay|好的|好|明白|了解|收到|嗯|哦|哦哦|行|可以的|辛苦了|再见|拜拜|bye|good night|good morning|晚安|早安)\s*[!！.。?？~～,，、…\-]*\s*$',
     re.IGNORECASE,
 )
 
@@ -207,6 +225,7 @@ def snapshot_status():
             "quota_limit": (_quota_est.get(label) or {}).get("limit", QUOTA_LIMIT),
             "quota_updated_at": (_quota_est.get(label) or {}).get("updated_at"),
             "sticky": label == (_token_pool[_sticky_idx][1] if 0 <= _sticky_idx < len(_token_pool) else None),
+            "bindings": _binding_count(label),
         })
     total_quota = sum(_quota_get(t[1]) for t in pool)
     return {
@@ -222,6 +241,8 @@ def snapshot_status():
         "tokens_quota_total": total_quota,
         "empty_edit_streak": _empty_edit_streak,
         "empty_edit_loop_limit": EMPTY_EDIT_LOOP_LIMIT,
+        "sessions_active": len([k for k, v in _session_ts.items() if time.time() - v <= SESSION_TTL]),
+        "session_map": {k: v for k, v in _session_map.items()},
         "stats": stats,
         "tokens": tokens,
     }
@@ -311,7 +332,62 @@ def _jwt_exp(token):
         return None
 
 
-def pick_token():
+SESSION_TTL = 7200.0        # 会话映射 2h 不活跃清理
+BINDING_PENALTY = 25000.0   # 多会话分配时，已被绑定的 token 惩罚分（鼓励分散）
+SESSION_MAP_FILE = None     # main 设置，默认 <token_dir 父目录>/session_map.json
+_session_map = {}           # session_key -> label（会话粘性绑定表）
+_session_ts = {}            # session_key -> last_seen
+_session_last_save = 0.0
+
+
+def _binding_count(label):
+    try:
+        return sum(1 for v in _session_map.values() if v == label)
+    except Exception:
+        return 0
+
+
+def _sessions_cleanup(now):
+    stale = [k for k, ts in _session_ts.items() if now - ts > SESSION_TTL]
+    for k in stale:
+        _session_map.pop(k, None)
+        _session_ts.pop(k, None)
+    if stale:
+        print(f"[gateway] session map cleanup: removed {len(stale)} stale", flush=True)
+
+
+def _sessions_save(force=False):
+    global _session_last_save
+    if not SESSION_MAP_FILE:
+        return
+    if not force and time.time() - _session_last_save < QUOTA_SAVE_INTERVAL:
+        return
+    _session_last_save = time.time()
+    try:
+        tmp = SESSION_MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_session_map, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SESSION_MAP_FILE)
+    except Exception:
+        pass
+
+
+def _sessions_load():
+    if SESSION_MAP_FILE and os.path.exists(SESSION_MAP_FILE):
+        try:
+            with open(SESSION_MAP_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                now = time.time()
+                for k, v in data.items():
+                    _session_map[str(k)] = str(v)
+                    _session_ts[str(k)] = now
+                print(f"[gateway] session map loaded: {len(data)} entries", flush=True)
+        except Exception as exc:
+            print(f"[gateway] session map load failed: {exc!r}", flush=True)
+
+
+def pick_token(session_key=None):
     """Sticky + quota-aware selection:
     1) sticky 优先：上次用的 token 若仍健康（未冷却/未过期/额度>0）直接复用（缓存连续性最大化）
     2) 否则选剩余额度最高且健康的 token 作为新 sticky
@@ -322,6 +398,18 @@ def pick_token():
         n = len(_token_pool)
         if n == 0:
             return None
+        bound_label = None
+        if session_key:
+            bound_label = _session_map.get(session_key)
+            if bound_label:
+                for i in range(n):
+                    t, label, ban_until, rt = _token_pool[i]
+                    if label != bound_label:
+                        continue
+                    if now >= ban_until and not _token_is_expired(t, now) and _quota_get(label) > QUOTA_EXHAUSTED_THRESHOLD:
+                        _session_ts[session_key] = now
+                        return (t, label)
+                print(f"[gateway] session {session_key[:21]} migrating from {bound_label} (unhealthy/exhausted)", flush=True)
         if 0 <= _sticky_idx < n:
             idx = _sticky_idx
             t, label, ban_until, rt = _token_pool[idx]
@@ -359,6 +447,8 @@ def pick_token():
                     self_heal_candidate = i
                 continue
             score = _quota_get(label) + (_pool_next * 1e-6)
+            if session_key:
+                score -= BINDING_PENALTY * _binding_count(label)
             if score > best_score:
                 best_score = score
                 best_idx = i
@@ -377,7 +467,15 @@ def pick_token():
                 _sticky_idx = i
                 return (_token_pool[i][0], label)
             return None
-        _sticky_idx = best_idx
+        if session_key:
+            new_label = _token_pool[best_idx][1]
+            _session_map[session_key] = new_label
+            _session_ts[session_key] = now
+            _sessions_cleanup(now)
+            _sessions_save()
+            print(f"[gateway] session {session_key[:21]} bound -> {new_label} (bindings={_binding_count(new_label)})", flush=True)
+        else:
+            _sticky_idx = best_idx
         _pool_next = (_pool_next + 1) % n
         return (_token_pool[best_idx][0], _token_pool[best_idx][1])
 
@@ -491,6 +589,137 @@ def _persist_token(label, new_token):
                 continue
     except Exception:
         pass
+
+
+# ------------- 后台额度探测线程 -------------
+PROBE_SCAN_INTERVAL = 15 * 60   # 每 15 分钟扫描一轮候选
+_probe_last = {}                # label -> 上次探测时间
+
+
+def _probe_one(token, label):
+    """发极小请求探测额度。返回 'revived'/'exhausted'/'rate_limited'/'revoked'/'error'。"""
+    try:
+        parsed = urlsplit(Handler.upstream)
+        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=30)
+        body = json.dumps({"model": "grok-4.6", "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1}).encode()
+        hdrs = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + token,
+            "x-grok-client-version": GROK_VERSION,
+            "x-grok-client-identifier": "grok-pager",
+        }
+        conn.request("POST", parsed.path + "/chat/completions", body=body, headers=hdrs)
+        resp = conn.getresponse()
+        status = resp.status
+        rbody = resp.read(65536).decode("utf-8", "replace")
+        conn.close()
+        if status == 200:
+            return "revived"
+        if status in (429, 402):
+            if "free-usage-exhausted" in rbody:
+                m = re.search(r"\(actual/limit\):\s*(\d+)\s*/\s*(\d+)", rbody)
+                if m:
+                    _quota_calibrate(label, int(m.group(1)), int(m.group(2)))
+                return "exhausted"
+            return "rate_limited"
+        if status in (401, 403):
+            return "revoked"
+        return "error"
+    except Exception:
+        return "error"
+
+
+def _reset_quota_full(label):
+    entry = _quota_est.setdefault(label, {})
+    entry["remaining"] = QUOTA_LIMIT
+    entry["actual"] = None
+    entry["updated_at"] = time.time()
+    _quota_save(force=True)
+
+
+def _background_probe_loop():
+    """独立线程：每 15 分钟找「冷却已结束 + 额度=0 + 距上次探测超阈值」的 token 逐个探测额度恢复。"""
+    while True:
+        time.sleep(PROBE_SCAN_INTERVAL)
+        now = time.time()
+        candidates = []
+        with _pool_lock:
+            for (t, label, ban_until, rt) in list(_token_pool):
+                if now < ban_until:
+                    continue
+                if _quota_get(label) > QUOTA_EXHAUSTED_THRESHOLD:
+                    continue
+                if now - _probe_last.get(label, 0) < PROBE_MIN_INTERVAL:
+                    continue
+                if not rt:
+                    continue
+                candidates.append((t, label, ban_until, rt))
+        for (t, label, ban_until, rt) in candidates:
+            _probe_last[label] = time.time()
+            probe_token = t
+            if _token_is_expired(t):
+                new_t = refresh_token_oauth(rt)
+                if not new_t:
+                    print(f"[gateway] probe: {label} access expired + refresh FAILED, skip", flush=True)
+                    continue
+                probe_token = new_t
+                with _pool_lock:
+                    for i, (tt, ll, bb, rr) in enumerate(_token_pool):
+                        if tt == t:
+                            _token_pool[i] = (new_t, ll, bb, rr)
+                            break
+                _persist_token(label, new_t)
+            result = _probe_one(probe_token, label)
+            print(f"[gateway] probe: {label} -> {result}", flush=True)
+            if result == "revived":
+                _reset_quota_full(label)
+                print(f"[gateway] probe: {label} quota restored to {QUOTA_LIMIT}", flush=True)
+            elif result == "revoked":
+                with _pool_lock:
+                    _token_pool[:] = [(tt, ll, bb, rr) for tt, ll, bb, rr in _token_pool if ll != label]
+                print(f"[gateway] probe: {label} revoked, removed from pool", flush=True)
+            # exhausted / rate_limited / error：保持 0，顺延下次探测
+
+
+def probe_all_tokens():
+    """一次性探测全部 token，恢复实际/剩余额度。返回汇总结果。"""
+    results = {"revived": [], "exhausted": [], "revoked": [], "rate_limited": [], "error": []}
+    with _pool_lock:
+        snapshot = list(_token_pool)
+    for (t, label, ban_until, rt) in snapshot:
+        prior_remaining = _quota_get(label)
+        probe_token = t
+        if _token_is_expired(t):
+            if not rt:
+                results["error"].append(label)
+                continue
+            new_t = refresh_token_oauth(rt)
+            if not new_t:
+                print(f"[probe-all] {label} access expired + refresh FAILED", flush=True)
+                results["error"].append(label)
+                continue
+            probe_token = new_t
+            with _pool_lock:
+                for i, (tt, ll, bb, rr) in enumerate(_token_pool):
+                    if tt == t:
+                        _token_pool[i] = (new_t, ll, bb, rr)
+                        break
+            _persist_token(label, new_t)
+        result = _probe_one(probe_token, label)
+        _probe_last[label] = time.time()
+        if result == "revived":
+            if prior_remaining <= QUOTA_EXHAUSTED_THRESHOLD:
+                _reset_quota_full(label)
+            results["revived"].append(label)
+        elif result == "revoked":
+            with _pool_lock:
+                _token_pool[:] = [(tt, ll, bb, rr) for tt, ll, bb, rr in _token_pool if ll != label]
+            results["revoked"].append(label)
+        else:
+            results.setdefault(result, []).append(label)
+        print(f"[probe-all] {label} -> {result}", flush=True)
+    _quota_save(force=True)
+    return results
 
 
 def _split_sse(raw):
@@ -761,10 +990,27 @@ class Handler(BaseHTTPRequestHandler):
                                     )
                                 last_user_text = str(c or "")
                                 break
+                    clean_user_text = strip_client_wrappers(last_user_text)
+                    _u = (clean_user_text or "").strip().lower()
+                    # 剥离一切 XML 风格标签（如 <dcp-message-id>m123</dcp-message-id>、<env> 等）
+                    _u = re.sub(r"<[^<>]{1,120}>", " ", _u)
+                    # 再剥非字母/汉字字符（零宽字符、控制符等不可见注入）
+                    _u = "".join(
+                        ch for ch in _u
+                        if (ch.isascii() and ch.isalpha()) or ("\u4e00" <= ch <= "\u9fff")
+                    )
+                    is_greeting = _u in {
+                        "hi", "hi there", "hello", "hey", "yo", "hey there",
+                        "你好", "您好", "嗨", "哈喽", "哈啰", "在吗", "在么",
+                        "再见", "拜拜", "bye", "good night", "good morning", "晚安", "早安",
+                    }
+                    is_ack = _u in {
+                        "ok", "okay", "好的", "好", "明白", "了解", "收到", "嗯", "哦", "哦哦",
+                        "行", "可以的", "辛苦了", "谢谢", "多谢", "感谢", "thanks", "thank you", "thx", "ty",
+                    }
                     small_talk = bool(
-                        not has_tool_history
-                        and last_user_text
-                        and SMALL_TALK_RE.match(last_user_text)
+                        clean_user_text
+                        and (is_greeting or (not has_tool_history and is_ack))
                     )
                     if not small_talk:
                         tc = bj.get("tool_choice")
@@ -776,9 +1022,10 @@ class Handler(BaseHTTPRequestHandler):
                             print(f"[gateway] FORCED tool_choice: {old} -> required", flush=True)
                     else:
                         if bj.get("tool_choice") != "auto":
+                            old_tc = bj.get("tool_choice")
                             bj["tool_choice"] = "auto"
                             body = json.dumps(bj).encode()
-                            print("[gateway] relaxed tool_choice -> auto (small talk)", flush=True)
+                            print(f"[gateway] relaxed tool_choice: {json.dumps(old_tc)[:40] if old_tc is not None else 'none'} -> auto ({'greeting' if is_greeting else 'small talk'})", flush=True)
                 hdrs["Content-Length"] = str(len(body))
             except Exception as e:
                 print(f"[gateway] body not json: {e!r}", flush=True)
@@ -788,8 +1035,40 @@ class Handler(BaseHTTPRequestHandler):
         retry_after = None
         max_cooldown = 0
         exhausted_all = False
+        session_key = None
+        try:
+            sid_hdr = self.headers.get("x-claude-code-session-id") or self.headers.get("x-session-id")
+            if sid_hdr:
+                session_key = "sid:" + sid_hdr.strip()[:64]
+            elif body:
+                try:
+                    sk_obj = json.loads(body)
+                except Exception:
+                    sk_obj = None
+                if isinstance(sk_obj, dict):
+                    msgs = sk_obj.get("messages") or sk_obj.get("input") or []
+                    sys_txt = ""
+                    first_user = ""
+                    if isinstance(msgs, list):
+                        for m in msgs:
+                            if not isinstance(m, dict):
+                                continue
+                            c = m.get("content")
+                            if isinstance(c, list):
+                                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+                            c = "" if c is None else str(c)
+                            role = str(m.get("role", ""))
+                            if role == "system" and not sys_txt:
+                                sys_txt = c[:512]
+                            if role == "user" and not first_user:
+                                first_user = c[:512]
+                    raw = (sys_txt + "\x00" + first_user).encode("utf-8", "ignore")
+                    if len(raw) >= 8:
+                        session_key = "hash:" + hashlib.sha256(raw).hexdigest()[:16]
+        except Exception:
+            session_key = None
         while True:
-            picked = pick_token()
+            picked = pick_token(session_key)
             if picked is None:
                 if exhausted_all or max_cooldown > 0:
                     self._reply(429, {
@@ -1068,6 +1347,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                     removed += 1
                     print(f"[gateway] control refresh FAILED (removed): {label}", flush=True)
             self._json(200, {"ok": True, "refreshed": refreshed, "removed": removed})
+        elif self.path == "/probe":
+            print("[gateway] control: manual probe-all triggered", flush=True)
+            results = probe_all_tokens()
+            summary = {k: len(v) for k, v in results.items()}
+            self._json(200, {"ok": True, "summary": summary, **results})
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
@@ -1091,7 +1375,9 @@ def main():
     ap.add_argument("--control-port", type=int, default=0,
                     help="控制端口（默认 0=关闭；设如 40201 可访问 /status、POST /refresh）")
     ap.add_argument("--quota-state-file", default=None,
-                    help="额度状态持久化文件（默认 <token_dir父目录>/quota_state.json；重启后恢复剩余额度估算，避免把已耗尽 token 当满额）")
+                    help="额度状态持久化文件（默认 <token_dir父目录>/quota_state.json）")
+    ap.add_argument("--session-map-file", default=None,
+                    help="会话粘性映射持久化文件（默认 <token_dir父目录>/session_map.json）")
     args = ap.parse_args()
 
     entries = []
@@ -1123,6 +1409,12 @@ def main():
     _quota_load()
     if QUOTA_STATE_FILE:
         print(f"[gateway] quota state file: {QUOTA_STATE_FILE} ({len(_quota_est)} entries loaded)", flush=True)
+    global SESSION_MAP_FILE
+    if args.session_map_file:
+        SESSION_MAP_FILE = args.session_map_file
+    elif args.token_dir:
+        SESSION_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(args.token_dir)), "session_map.json")
+    _sessions_load()
     Handler.force_tool_choice = args.force_tool_choice
     Handler.force_non_stream = args.force_non_stream
     Handler.filter_empty_edit = args.filter_empty_edit
@@ -1145,6 +1437,8 @@ def main():
                 _quota_save(force=True)
 
     Thread(target=_flush_loop, daemon=True).start()
+    threading.Thread(target=_background_probe_loop, daemon=True).start()
+    print(f"[gateway] background quota probe enabled (scan every {PROBE_SCAN_INTERVAL}s)", flush=True)
     print(f"grok gateway listening on http://127.0.0.1:{args.port} -> {Handler.upstream}", flush=True)
     print(f"tokens: {[lb for _, lb, _, _ in entries]}", flush=True)
     srv.serve_forever()
