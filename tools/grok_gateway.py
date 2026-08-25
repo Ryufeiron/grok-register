@@ -119,6 +119,8 @@ QUOTA_SAVE_INTERVAL = 30.0  # quota state disk-flush throttle (seconds)
 _REQ_TOOLS = {"names": [], "bash_name": None}   # 最近一次请求的工具名（多线程由 GIL 保护，可接受）
 EMPTY_EDIT_LOOP_LIMIT = 3                        # 连续空 Edit 次数阈值，超过后解除 FORCED 破环
 _empty_edit_streak = 0                           # 当前连续空 Edit 计数
+DEGEN_FORCED_LIMIT = 4                           # FORCED fast-empty streak threshold before falling back to keep-client
+_DEGEN_STREAK = {"n": 0}                         # consecutive FORCED degenerate fast-empty responses (global)
 GREETING_RE = re.compile(
     r'^\s*(hi|hi there|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|再见|拜拜|bye|good night|good morning|晚安|早安)\s*[!！.。?？~～,，、…\-]*\s*$',
     re.IGNORECASE,
@@ -136,6 +138,45 @@ def strip_client_wrappers(text):
     except Exception:
         return text or ""
     return cleaned.strip()
+
+
+_DCP_TAG_RES = (
+    re.compile(r'<dcp-message-id>[^<]{0,80}</dcp-message-id>', re.IGNORECASE),
+    re.compile(r'<dcp-system-reminder>.*?</dcp-system-reminder>', re.DOTALL | re.IGNORECASE),
+)
+
+
+def _strip_dcp_tags(text):
+    n = 0
+    for pat in _DCP_TAG_RES:
+        text, k = pat.subn('', text)
+        n += k
+    return text, n
+
+
+def _sanitize_conversation(bj):
+    """剥离会话所有消息里的 dcp 元数据标签，返回清洗数。"""
+    total = 0
+    conv = bj.get('messages') if isinstance(bj.get('messages'), list) else (bj.get('input') if isinstance(bj.get('input'), list) else None)
+    if not conv:
+        return 0
+    for msg in conv:
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get('content')
+        if isinstance(c, str):
+            t, n = _strip_dcp_tags(c)
+            if n:
+                msg['content'] = t
+                total += n
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and isinstance(part.get('text'), str):
+                    t, n = _strip_dcp_tags(part['text'])
+                    if n:
+                        part['text'] = t
+                        total += n
+    return total
 SMALL_TALK_RE = re.compile(
     r'^\s*(hi|hello|hey|yo|hey there|你好|您好|嗨|哈喽|哈啰|在吗|在么|谢谢|多谢|感谢|thanks|thank you|thx|ty|ok|okay|好的|好|明白|了解|收到|嗯|哦|哦哦|行|可以的|辛苦了|再见|拜拜|bye|good night|good morning|晚安|早安)\s*[!！.。?？~～,，、…\-]*\s*$',
     re.IGNORECASE,
@@ -893,6 +934,8 @@ class Handler(BaseHTTPRequestHandler):
     force_tool_choice = False
     force_non_stream = False
     filter_empty_edit = False
+    shell_hint = False
+    repeat_guard = False
 
     def log_message(self, fmt, *args):
         print(f"[gateway] {self.command} {self.path} <- {self.headers.get('User-Agent','')[:60]}", flush=True)
@@ -1008,28 +1051,101 @@ class Handler(BaseHTTPRequestHandler):
                         "ok", "okay", "好的", "好", "明白", "了解", "收到", "嗯", "哦", "哦哦",
                         "行", "可以的", "辛苦了", "谢谢", "多谢", "感谢", "thanks", "thank you", "thx", "ty",
                     }
+                    has_assistant_text = False
+                    if isinstance(conversation, list):
+                        for msg in conversation[:-1]:
+                            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                                continue
+                            c = msg.get("content")
+                            if isinstance(c, list):
+                                c = " ".join(
+                                    p.get("text", "") if isinstance(p, dict) else str(p)
+                                    for p in c
+                                )
+                            if isinstance(c, str) and len(c.strip()) >= 80:
+                                has_assistant_text = True
+                                break
                     small_talk = bool(
                         clean_user_text
                         and (is_greeting or (not has_tool_history and is_ack))
                     )
-                    if not small_talk:
+                    if small_talk:
+                        if bj.get("tool_choice") != "auto":
+                            old_tc = bj.get("tool_choice")
+                            bj["tool_choice"] = "auto"
+                            body = json.dumps(bj).encode()
+                            print(f"[gateway] relaxed tool_choice: {json.dumps(old_tc)[:40] if old_tc is not None else 'none'} -> auto ({'greeting' if is_greeting else 'small talk'})", flush=True)
+                    elif has_assistant_text or _DEGEN_STREAK["n"] >= DEGEN_FORCED_LIMIT:
+                        if _DEGEN_STREAK["n"] >= DEGEN_FORCED_LIMIT and not has_assistant_text:
+                            print("[gateway] degenerate-loop guard (%d forced fast-empty responses): keep client tool_choice" % _DEGEN_STREAK["n"], flush=True)
+                        else:
+                            print("[gateway] keep client tool_choice (assistant already producing text)", flush=True)
+                    else:
                         tc = bj.get("tool_choice")
                         cur = tc.get("type") if isinstance(tc, dict) else str(tc)
                         if cur != "required":
                             old = json.dumps(tc)[:80] if tc is not None else "none"
                             bj["tool_choice"] = "required"
                             body = json.dumps(bj).encode()
+                            forced_now = True
                             print(f"[gateway] FORCED tool_choice: {old} -> required", flush=True)
-                    else:
-                        if bj.get("tool_choice") != "auto":
-                            old_tc = bj.get("tool_choice")
-                            bj["tool_choice"] = "auto"
-                            body = json.dumps(bj).encode()
-                            print(f"[gateway] relaxed tool_choice: {json.dumps(old_tc)[:40] if old_tc is not None else 'none'} -> auto ({'greeting' if is_greeting else 'small talk'})", flush=True)
+                    # shell-hint：检测 bash 类工具时注入 PowerShell 环境提示（幂等，只注一次）
+                    if Handler.shell_hint:
+                        try:
+                            tools_list_ = bj.get("tools") or []
+                            has_bash_tool = any(
+                                (isinstance(t, dict) and (
+                                    str((t.get("function") or {}).get("name", "")).lower() in ("bash", "execute_bash", "run_command", "shell")
+                                    or str(t.get("name", "")).lower() in ("bash", "execute_bash", "run_command", "shell")
+                                ))
+                                for t in tools_list_ if isinstance(t, dict)
+                            )
+                            msgs_ = bj.get("messages")
+                            if has_bash_tool and isinstance(msgs_, list) and msgs_:
+                                marker = "[gateway] Shell environment:"
+                                first_txt = ""
+                                m0 = msgs_[0]
+                                c0 = m0.get("content") if isinstance(m0, dict) else None
+                                if isinstance(c0, str):
+                                    first_txt = c0
+                                elif isinstance(c0, list):
+                                    first_txt = " ".join(p.get("text", "") for p in c0 if isinstance(p, dict))
+                                if marker not in first_txt and marker not in json.dumps(bj)[:4000]:
+                                    hint = (
+                                        "[gateway] Shell environment: Windows PowerShell. "
+                                        "Generate PowerShell syntax ONLY: use Get-ChildItem instead of ls/dir; "
+                                        "use Select-Object -First N instead of head/tail; "
+                                        "do NOT use &&, /b, /ad, /s flags; quote paths normally. "
+                                        "If a command fails with a PowerShell error, rewrite it in pure PowerShell syntax. "
+                                        "[gateway] Grounding rule: NEVER claim a file or directory exists, and never "
+                                        "describe its contents or line count, unless a tool result in THIS conversation "
+                                        "actually listed or read it. When asked to confirm existence, ALWAYS verify with "
+                                        "a listing/read tool first and cite the real result; if not found, say so plainly. "
+                                        "Conciseness rule: end your reply IMMEDIATELY once the task is complete - do NOT "
+                                        "append repeated status lines, farewells, or variants like 'Ready', 'Done', "
+                                        "'已完成', '(随时可继续)', 'Status: ...' after the answer."
+                                    )
+                                    if isinstance(m0, dict) and m0.get("role") == "system" and isinstance(m0.get("content"), str):
+                                        m0["content"] = m0["content"].rstrip() + "\n\n" + hint
+                                    else:
+                                        msgs_.insert(0, {"role": "system", "content": hint})
+                                    body = json.dumps(bj).encode()
+                                    print("[gateway] SHELL HINT injected (PowerShell)", flush=True)
+                        except Exception as e:
+                            print(f"[gateway] shell-hint skipped: {e!r}", flush=True)
                 hdrs["Content-Length"] = str(len(body))
+                try:
+                    _n_tags = _sanitize_conversation(bj)
+                    if _n_tags:
+                        body = json.dumps(bj).encode()
+                        hdrs["Content-Length"] = str(len(body))
+                        print(f"[gateway] DCP stripped {_n_tags} meta tag(s)", flush=True)
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[gateway] body not json: {e!r}", flush=True)
 
+        forced_now = False
         used_tokens = set()
         status = None
         retry_after = None
@@ -1210,6 +1326,58 @@ class Handler(BaseHTTPRequestHandler):
                     import gzip as _gz
                     stream_gz = _gz.GzipFile(fileobj=resp)
                 acc = _DUMP_BODY   # SSE 流不累积全量体（省内存拷贝）；JSON 响应用于 usage 解析
+                # Repetition Guard 状态：检测同一行文本重复输出（grok 退化形态④收尾复读）
+                _rep_lines = {}
+                _rep_tail = ""
+                _is_responses_sse = "/responses" in self.path
+                guard_hit = False
+
+                def _rep_feed(text):
+                    """累积文本并统计行出现次数；返回 True 表示某行重复超限。"""
+                    nonlocal _rep_tail
+                    if not text:
+                        return False
+                    _rep_tail += text
+                    if len(_rep_tail) > 8192:
+                        _rep_tail = _rep_tail[-4096:]
+                    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                    for ln in lines:
+                        if len(ln) >= 6:   # 忽略过短的行（标点/单符号）
+                            _rep_lines[ln] = _rep_lines.get(ln, 0) + 1
+                            if _rep_lines[ln] >= 4:
+                                return True
+                    return False
+
+                def _rep_extract(chunk):
+                    """从 SSE/JSON chunk 提取文本增量。"""
+                    out = []
+                    try:
+                        s = chunk.decode("utf-8", "replace")
+                        for line in s.splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload or payload == "[DONE]":
+                                continue
+                            try:
+                                ev = json.loads(payload)
+                            except Exception:
+                                continue
+                            if isinstance(ev, dict):
+                                if ev.get("type") == "response.output_text.delta":
+                                    d = ev.get("delta")
+                                    if isinstance(d, str):
+                                        out.append(d)
+                                elif "choices" in ev:
+                                    for chd in ev["choices"]:
+                                        dd = chd.get("delta") or {}
+                                        cc = dd.get("content")
+                                        if isinstance(cc, str):
+                                            out.append(cc)
+                    except Exception:
+                        pass
+                    return "".join(out)
+
                 chunk = (stream_gz.read1(262144) if stream_gz else resp.read1(262144)) or b""
                 while chunk:
                     if not acc and not resp_body and chunk[:1] == b"{":
@@ -1220,6 +1388,15 @@ class Handler(BaseHTTPRequestHandler):
                         print(f"[gateway] SSE [DONE] seen after {time.time()-t_start:.1f}s", flush=True)
                     if b'response.completed' in chunk:
                         print(f"[gateway] response.completed seen at {time.time()-t_start:.1f}s", flush=True)
+                    if not guard_hit and Handler.repeat_guard:
+                        try:
+                            if _rep_feed(_rep_extract(chunk)):
+                                guard_hit = True
+                                print(f"[gateway] REPEAT GUARD triggered at {time.time()-t_start:.1f}s (repeated tail line)", flush=True)
+                                stats_record(label, "repeat_guard")
+                                break   # 停止透传；下方伪造正常收尾
+                        except Exception:
+                            pass
                     try:
                         self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                         self.wfile.flush()
@@ -1233,12 +1410,39 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 except Exception:
                     pass
+                if guard_hit:
+                    # 伪造正常收尾，让客户端认为流完整结束（避免重试/挂起）
+                    try:
+                        if _is_responses_sse:
+                            tail_ev = (
+                                b'event: response.completed\r\n'
+                                b'data: {"type":"response.completed","sequence_number":999999,'
+                                b'"response":{"id":"resp_guard_truncated","object":"response",'
+                                b'"status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0}}}\r\n\r\n'
+                                b'data: [DONE]\r\n\r\n'
+                            )
+                        else:
+                            tail_ev = (
+                                b'data: {"id":"chatcmpl-guard","object":"chat.completion.chunk",'
+                                b'"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\r\n\r\n'
+                                b'data: [DONE]\r\n\r\n'
+                            )
+                        self.wfile.write(b"%x\r\n" % len(tail_ev) + tail_ev + b"\r\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
                 try:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                 except Exception:
                     pass
                 print(f"[gateway] upstream body EOF after {time.time()-t_start:.1f}s total, resp_rcvd={len(resp_body)}", flush=True)
+                if forced_now:
+                    _el = time.time() - t_start
+                    if _el < 1.6:
+                        _DEGEN_STREAK["n"] += 1
+                    else:
+                        _DEGEN_STREAK["n"] = 0
                 try:
                     if resp_body[:1] == b"{":
                         try:
@@ -1335,7 +1539,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 new_t = refresh_token_oauth(rt)
                 if new_t:
                     with _pool_lock:
-                        _token_pool[idx] = (new_t, label, 0.0, rt)
+                        for i2, (t2, lb2, _bt2, _rt2) in enumerate(_token_pool):
+                            if lb2 == label:
+                                _token_pool[i2] = (new_t, label, 0.0, rt)
+                                break
                     _persist_token(label, new_t)
                     stats_record(label, "refresh")
                     refreshed += 1
@@ -1372,6 +1579,10 @@ def main():
                     help="过滤响应中的 old_string==new_string 的空 Edit 工具调用，替换为提示文本（防 Claude Code 编辑死循环）")
     ap.add_argument("--force-non-stream", action="store_true",
                     help="把 responses 请求的 stream 强制改为 False（上游返回完整 JSON 而非 SSE，规避 cc-switch 流式解码失败）")
+    ap.add_argument("--shell-hint", action="store_true",
+                    help="inject Windows PowerShell hint when bash-like tools present")
+    ap.add_argument("--repeat-guard", action="store_true",
+                    help="truncate streaming responses when the same output line repeats 4+ times (grok degeneration)")
     ap.add_argument("--control-port", type=int, default=0,
                     help="控制端口（默认 0=关闭；设如 40201 可访问 /status、POST /refresh）")
     ap.add_argument("--quota-state-file", default=None,
@@ -1416,6 +1627,8 @@ def main():
         SESSION_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(args.token_dir)), "session_map.json")
     _sessions_load()
     Handler.force_tool_choice = args.force_tool_choice
+    Handler.shell_hint = args.shell_hint
+    Handler.repeat_guard = args.repeat_guard
     Handler.force_non_stream = args.force_non_stream
     Handler.filter_empty_edit = args.filter_empty_edit
     Handler.exhaust_ban_hours = args.exhaust_ban_hours

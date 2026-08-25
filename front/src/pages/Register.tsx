@@ -13,6 +13,7 @@ import {
   Loader2,
   MoreHorizontal,
   Play,
+  RefreshCw,
   RotateCcw,
   Search,
   Square,
@@ -21,7 +22,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { api, type AccountRecord, type GatewayStatus, type GatewayTask, type JobStatus, type LogItem } from "@/lib/api";
+import { api, type AccountRecord, type GatewaySchedule, type GatewayStatus, type GatewayTask, type JobStatus, type LogItem } from "@/lib/api";
 import {
   Badge,
   Button,
@@ -38,8 +39,9 @@ import {
   buttonVariants,
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import { LogTail, PoolSummaryTiles, RunBadge } from "@/components/shared/TaskBits";
 
-type BusyAction = "" | "start" | "stop" | "check" | "kill" | "register" | "refresh";
+type BusyAction = "" | "start" | "stop" | "check" | "kill" | "register" | "refresh" | "probe";
 type RegisterMode = "local" | "actions";
 type LogTone = "default" | "success" | "error" | "warn" | "info";
 type DisplayLogItem = LogItem & { tone: LogTone; searchText: string };
@@ -151,6 +153,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const [mode, setMode] = useState<RegisterMode>("local");
   const [gwStatus, setGwStatus] = useState<GatewayStatus | null>(null);
   const [gwTask, setGwTask] = useState<GatewayTask | null>(null);
+  const [sched, setSched] = useState<GatewaySchedule>({ enabled: true, time: "22:00" });
+  const [schedBusy, setSchedBusy] = useState(false);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [logs, setLogs] = useState<DisplayLogItem[]>([]);
   const [renderedLogLimit, setRenderedLogLimit] = useState(DEFAULT_RENDERED_LOGS);
@@ -255,19 +259,19 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       .catch(() => undefined);
   }, []);
 
-  // Actions 模式下轮询网关状态与注册任务进度
+  // Actions 模式下轮询网关状态与注册任务进度；运行监控页同样轮询
   useEffect(() => {
-    if (view !== "new" || mode !== "actions") return;
+    if ((view !== "new" || mode !== "actions") && view !== "runtime") return;
     let cancelled = false;
     const tick = async () => {
       if (cancelled) return;
       try {
-        const [status, task] = await Promise.all([api.gatewayStatus(), api.gatewayRegisterStatus()]);
+        const ov = await api.tasksOverview();
         if (cancelled) return;
-        setGwStatus(status);
-        setGwTask(task.task ?? null);
+        if (ov.gateway_pool) setGwStatus(ov.gateway_pool);
+        setGwTask(ov.actions_task ?? null);
       } catch {
-        // 网关控制接口不可用（旧版后端）时静默
+        // 聚合接口不可用（旧版后端）时静默
       }
     };
     const timer = window.setInterval(tick, 4000);
@@ -412,6 +416,28 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     }
   };
 
+  const onScheduleSave = async () => {
+    setSchedBusy(true);
+    try {
+      const result = await api.gatewaySchedulePut({ enabled: sched.enabled, time: sched.time });
+      setSched((s) => ({ ...s, ...result }));
+      showToast(result.enabled ? `已保存：每天 ${result.time} 自动注册` : "已关闭每日自动注册", "success");
+    } catch (err: any) {
+      showToast(err.message || "保存调度配置失败", "error");
+    } finally {
+      setSchedBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (view !== "new" || mode !== "actions") return;
+    let cancelled = false;
+    api.gatewayScheduleGet().then((r) => {
+      if (!cancelled && r?.schedule) setSched(r.schedule);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [view, mode]);
+
   const onGatewayRegister = async () => {
     setBusyAction("register");
     try {
@@ -425,6 +451,24 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       setGwTask(task.task ?? null);
     } catch (err: any) {
       showToast(err.message || "触发注册失败", "error");
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  const onProbe = async () => {
+    setBusyAction("probe");
+    showToast("正在逐个探测全部 token 额度，可能需要 1-3 分钟", "default");
+    try {
+      const data = await api.gatewayProbe();
+      setGwStatus(data);
+      const s = data.summary ?? {};
+      showToast(
+        `探测完成：恢复 ${s.revived ?? 0} 个 · 耗尽 ${s.exhausted ?? 0} · 吊销 ${s.revoked ?? 0}`,
+        "success"
+      );
+    } catch (err: any) {
+      showToast(err.message || "额度探测失败", "error");
     } finally {
       setBusyAction("");
     }
@@ -616,6 +660,27 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   {busyAction === "register" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                   {gwTask?.running ? "注册进行中…" : "注册新 Token"}
                 </Button>
+                <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5">
+                  <input
+                    id="daily-reg-enabled"
+                    type="checkbox"
+                    checked={sched.enabled}
+                    onChange={(e) => setSched({ ...sched, enabled: e.target.checked })}
+                    className="h-3.5 w-3.5 accent-slate-900"
+                  />
+                  <label htmlFor="daily-reg-enabled" className="text-xs font-medium text-slate-700">每日自动注册</label>
+                  <input
+                    type="time"
+                    value={sched.time}
+                    onChange={(e) => setSched({ ...sched, time: e.target.value })}
+                    disabled={!sched.enabled}
+                    className="h-7 rounded-md border border-slate-200 px-1.5 text-xs text-slate-800 focus:border-slate-400 focus:outline-none disabled:opacity-50"
+                  />
+                  <Button variant="outline" onClick={onScheduleSave} disabled={schedBusy}>
+                    {schedBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                    保存
+                  </Button>
+                </div>
               </div>
               {!gwTask?.running && gwTask?.actions ? (
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
@@ -699,7 +764,13 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
 
               {gwStatus && gwStatus.tokens && gwStatus.tokens.length > 0 ? (
                 <div className="rounded-xl border border-slate-200 p-4">
-                  <div className="text-sm font-semibold text-slate-900">Token 额度明细</div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-semibold text-slate-900">Token 额度明细</div>
+                    <Button variant="outline" size="sm" onClick={onProbe} disabled={!!busyAction}>
+                      {busyAction === "probe" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                      立即探测全部额度
+                    </Button>
+                  </div>
                   <div className="mt-2 overflow-x-auto">
                     <table className="w-full text-left text-xs">
                       <thead>
@@ -715,7 +786,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                       <tbody>
                         {gwStatus.tokens.map((token) => {
                           const quotaRemaining = token.quota_remaining ?? 0;
-                          const quotaActual = token.quota_actual ?? quotaRemaining;
+                          const hasActual = token.quota_actual != null;
+                          const quotaActual = hasActual ? token.quota_actual : null;
                           const quotaLimit = token.quota_limit ?? 500000;
                           const statusText = token.expired
                             ? "过期"
@@ -735,7 +807,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                                 {(quotaRemaining / 10000).toFixed(1)} 万
                               </td>
                               <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
-                                {Math.round(quotaActual / 1000)}k / {Math.round(quotaLimit / 1000)}k
+                                {hasActual ? `${Math.round(quotaActual / 1000)}k` : "—"} / {Math.round(quotaLimit / 1000)}k
                                 <div className="mt-0.5 ml-auto h-1 w-20 overflow-hidden rounded-full bg-slate-200">
                                   <div
                                     className={cn(
@@ -1072,6 +1144,58 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               </span>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* 远程注册（GitHub Actions）：状态与结果同步 */}
+      <Card className="overflow-hidden">
+        <CardHeader className="border-b border-slate-100 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+              远程注册 · GitHub Actions
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium",
+                  gwTask?.running ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600"
+                )}
+              >
+                <span className={cn("h-1.5 w-1.5 rounded-full", gwTask?.running ? "animate-pulse bg-amber-500" : "bg-slate-400")} />
+                {gwTask?.running ? "执行中" : "空闲"}
+              </span>
+            </CardTitle>
+            <RunBadge actions={gwTask?.actions} />
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 p-4 sm:p-6">
+          {(() => {
+            const lr = gwTask?.last_result;
+            return (
+              <>
+                <PoolSummaryTiles pool={gwStatus} />
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                    <div className="text-xs text-slate-500">上次注册</div>
+                    <div className="mt-1 text-sm font-semibold">
+                      {!lr ? (
+                        <span className="text-slate-400">—</span>
+                      ) : lr.ok ? (
+                        <Badge variant="success">成功</Badge>
+                      ) : (
+                        <Badge variant="destructive">失败</Badge>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
+                    <div className="text-xs text-slate-500">结束时间</div>
+                    <div className="mt-1 truncate text-sm font-medium tabular-nums text-slate-900">
+                      {lr?.finished ? formatClock(lr.finished) : "—"}
+                    </div>
+                  </div>
+                </div>
+                <LogTail lines={lr?.stdout_tail} />
+              </>
+            );
+          })()}
         </CardContent>
       </Card>
 

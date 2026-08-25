@@ -28,8 +28,11 @@ from .account_exports import build_account_auth_archive, build_sso_archive, read
 from .gateway_control import (
     _task_snapshot as run_status,
     gateway_status,
+    get_schedule,
+    probe_tokens,
     refresh_tokens,
     register_now,
+    set_schedule,
     start_gateway,
     stop_gateway,
 )
@@ -1528,6 +1531,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=result.get("error", "刷新失败"))
         return result
 
+    @app.post("/api/gateway/probe")
+    def api_gateway_probe() -> Dict[str, Any]:
+        result = probe_tokens()
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "探测失败"))
+        return result
+
     @app.post("/api/gateway/register")
     def api_gateway_register() -> Dict[str, Any]:
         result = register_now()
@@ -1538,6 +1548,37 @@ def create_app() -> FastAPI:
     @app.get("/api/gateway/register/status")
     def api_gateway_register_status() -> Dict[str, Any]:
         return {"ok": True, "task": run_status()}
+
+    @app.get("/api/tasks/overview")
+    def api_tasks_overview() -> Dict[str, Any]:
+        """统一任务快照：本地注册 + 远程注册 + Token 池 + 调度配置。"""
+        try:
+            actions_task = run_status()
+        except Exception:
+            actions_task = {"running": False, "last_result": None}
+        try:
+            pool = gateway_status()
+        except Exception:
+            pool = None
+        try:
+            schedule = get_schedule()
+        except Exception:
+            schedule = None
+        return {
+            "ok": True,
+            "local_job": job_coordinator.status(),
+            "actions_task": actions_task,
+            "gateway_pool": pool,
+            "schedule": schedule,
+        }
+
+    @app.get("/api/gateway/schedule")
+    def api_gateway_schedule_get() -> Dict[str, Any]:
+        return {"ok": True, "schedule": get_schedule()}
+
+    @app.put("/api/gateway/schedule")
+    def api_gateway_schedule_put(body: Dict[str, Any]) -> Dict[str, Any]:
+        return set_schedule(body)
 
     @app.api_route("/api/connectivity", methods=["GET", "POST"])
     def api_connectivity() -> Dict[str, Any]:

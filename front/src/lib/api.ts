@@ -523,6 +523,11 @@ export const api = {
     request<{ ok: boolean; already_stopped?: boolean }>("/api/gateway/stop", { method: "POST" }),
   gatewayRefresh: () =>
     request<{ ok: boolean } & GatewayStatus>("/api/gateway/refresh", { method: "POST" }),
+  gatewayProbe: () =>
+    request<{ ok: boolean; summary?: Record<string, number>; revived?: string[]; exhausted?: string[]; revoked?: string[] } & GatewayStatus>(
+      "/api/gateway/probe",
+      { method: "POST" }
+    ),
   gatewayRegister: () =>
     request<{ ok: boolean; already_running?: boolean; started?: boolean; task?: GatewayTask }>(
       "/api/gateway/register",
@@ -530,4 +535,27 @@ export const api = {
     ),
   gatewayRegisterStatus: () =>
     request<{ ok: boolean; task: GatewayTask }>("/api/gateway/register/status"),
+  gatewayScheduleGet: () =>
+    request<{ ok: boolean; schedule: GatewaySchedule }>("/api/gateway/schedule"),
+  gatewaySchedulePut: (payload: Partial<GatewaySchedule>) =>
+    request<GatewaySchedule & { ok: boolean }>("/api/gateway/schedule", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  tasksOverview: () =>
+    request<{
+      ok: boolean;
+      local_job?: JobStatus | null;
+      actions_task?: GatewayTask | null;
+      gateway_pool?: GatewayStatus | null;
+      schedule?: GatewaySchedule | null;
+    }>("/api/tasks/overview"),
+};
+
+export type GatewaySchedule = {
+  enabled: boolean;
+  time: string;
+  random_delay_max_min?: number;
+  task_exists?: boolean;
+  task_state?: string | null;
 };

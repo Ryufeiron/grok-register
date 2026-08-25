@@ -130,7 +130,10 @@ def fetch_artifacts(run_id, token, dest_dir):
     gh run download 会将 artifact **解压**到 -D 目录（不产生 zip），
     返回找到的 xai-*.json 文件路径列表。
     """
-    gh = os.environ.get("GRK_GH_EXE") or "gh"
+    gh = os.environ.get("GRK_GH_EXE")
+    if not gh:
+        local_gh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh", "gh.exe")
+        gh = local_gh if os.path.isfile(local_gh) else "gh"
     env = dict(os.environ)
     if token and not env.get("GH_TOKEN"):
         env["GH_TOKEN"] = token
@@ -253,6 +256,7 @@ def restart_gateway():
         "--force-tool-choice",
         "--filter-empty-edit",
         "--force-non-stream",
+        "--shell-hint",
         "--control-port", "40201",
     ]
     try:
@@ -278,17 +282,59 @@ def restart_gateway():
     return False
 
 
+def finalize_run(run_id: int) -> int:
+    """等待指定 run 完成 -> 下载 artifact -> 合并 token -> 重启网关。"""
+    token = get_github_token()
+    if not token:
+        log("WARNING: no github credential; artifact download will fail")
+
+    run = wait_run(run_id)
+    if not run:
+        return 1
+    if run.get("conclusion") != "success":
+        log("run not success; cannot download artifacts reliably")
+
+    tmp = tempfile.mkdtemp(prefix="daily_token_")
+    token_files = fetch_artifacts(run_id, token, tmp) if token else []
+    if not token_files:
+        log("no token files downloaded from artifact")
+        return 1
+
+    new_tokens = collect_tokens_from_files(token_files)
+    if not new_tokens:
+        log("no valid tokens found in artifact files")
+        return 1
+    added = merge_tokens(TOKEN_DIR, new_tokens)
+    sync_account_files(os.path.join(REPO_DIR, "data", "accounts"), TOKEN_DIR)
+
+    restart_gateway()
+
+    after_count = len([f for f in os.listdir(TOKEN_DIR) if f.endswith('.json')]) if os.path.isdir(TOKEN_DIR) else 0
+    log(f"after: {after_count} tokens (added {len(added)})")
+    log("daily token refresh DONE")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--now", action="store_true", help="立即触发并等待一轮")
     ap.add_argument("--dry-run", action="store_true", help="只触发+汇报，不下载不合并")
+    ap.add_argument("--attach", type=int, default=None, metavar="RUN_ID",
+                    help="接管已存在的 run：等待完成并下载合并（不触发新 run）")
     args = ap.parse_args()
+
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+
+    # 接管模式：不触发，直接收尾既有 run
+    if args.attach:
+        log(f"attach mode: taking over run {args.attach}")
+        return finalize_run(args.attach)
+
 
     if not args.now and not args.dry_run:
         log("no action flag; use --now to trigger a run now")
         return
 
-    os.makedirs(TOKEN_DIR, exist_ok=True)
     token = get_github_token()
     if token:
         log("github credential ok")
@@ -307,35 +353,8 @@ def main():
         log("dry-run: skipping wait/download/merge")
         return 0
 
-    # 2. 等待完成
-    run = wait_run(run_id)
-    if not run:
-        return 1
-    if run.get("conclusion") != "success":
-        log("run not success; cannot download artifacts reliably")
-
-    # 3. 下载 artifact
-    tmp = tempfile.mkdtemp(prefix="daily_token_")
-    token_files = fetch_artifacts(run_id, token, tmp) if token else []
-    if not token_files:
-        log("no token files downloaded from artifact")
-        return 1
-
-    # 4. 合并 token
-    new_tokens = collect_tokens_from_files(token_files)
-    if not new_tokens:
-        log("no valid tokens found in artifact files")
-        return 1
-    added = merge_tokens(TOKEN_DIR, new_tokens)
-    sync_account_files(os.path.join(REPO_DIR, "data", "accounts"), TOKEN_DIR)
-
-    # 5. 重启网关
-    restart_gateway()
-
-    after_count = len([f for f in os.listdir(TOKEN_DIR) if f.endswith('.json')]) if os.path.isdir(TOKEN_DIR) else 0
-    log(f"after: {after_count} tokens (added {len(added)})")
-    log("daily token refresh DONE")
-    return 0
+    # 2-5. 等待/下载/合并/重启
+    return finalize_run(run_id)
 
 
 if __name__ == "__main__":
